@@ -397,9 +397,14 @@ export function recordUsage(rows: Omit<UsageRow, 'fetched_at'>[]): void {
 
 export function latestUsage(pool?: Pool): Record<string, Record<string, UsageRow>> {
   const db = initDb();
+  // 최신 스냅샷만: (pool, slot, window)별 가장 최근 1행 — 전체 히스토리 스캔 방지
   const rows = pool
-    ? db.prepare('SELECT * FROM usage_snapshots WHERE pool=? ORDER BY fetched_at DESC').all(pool)
-    : db.prepare('SELECT * FROM usage_snapshots ORDER BY fetched_at DESC').all();
+    ? db.prepare(`SELECT * FROM usage_snapshots u WHERE pool=? AND fetched_at = (
+        SELECT MAX(fetched_at) FROM usage_snapshots u2
+        WHERE u2.pool = u.pool AND u2.slot = u.slot AND u2.window = u.window)`.trim()).all(pool)
+    : db.prepare(`SELECT * FROM usage_snapshots u WHERE fetched_at = (
+        SELECT MAX(fetched_at) FROM usage_snapshots u2
+        WHERE u2.pool = u.pool AND u2.slot = u.slot AND u2.window = u.window)`.trim()).all();
   const out: Record<string, Record<string, UsageRow>> = {};
   for (const r of rows as any[]) {
     const key = `${r.pool}:${r.slot}`;

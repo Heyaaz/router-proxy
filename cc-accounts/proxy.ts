@@ -21,6 +21,9 @@ const UPSTREAM = { hostname: 'api.commandcode.ai', port: 443 };
 
 const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}` : '***');
 
+// 업스트림 TLS 연결 재사용 (요청마다 핸드셰이크 방지)
+const agent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
+
 initDb();
 let keys: KeyEntry[] = [];
 let usage = latestUsage();
@@ -69,7 +72,7 @@ function forward(
   };
   delete headers.authorization;
   const r = https.request(
-    { ...UPSTREAM, method: req.method, path: req.url, headers },
+    { ...UPSTREAM, method: req.method, path: req.url, headers, agent },
     (up) => {
       const retriable = up.statusCode === 401 || up.statusCode === 429;
       if (retriable && onFail) {

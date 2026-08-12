@@ -29,6 +29,20 @@ const PORT = Number(process.env.CC_PROXY_PORT ?? 9091);
 
 const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}` : '***');
 
+// 업스트림 TLS 연결 재사용 (요청마다 핸드셰이크 방지)
+const agent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
+
+// model_pattern 정규식 캐시 (provider id → RegExp)
+const regexCache = new Map<string, RegExp>();
+function patternRe(p: Provider): RegExp {
+  let re = regexCache.get(p.id);
+  if (!re) {
+    try { re = new RegExp(p.model_pattern); } catch { re = /.*/; }
+    regexCache.set(p.id, re);
+  }
+  return re;
+}
+
 // ---------- DB 로딩 ----------
 initDb();
 let providers: Provider[] = [];
@@ -37,6 +51,9 @@ let usage = latestUsage();
 
 function loadFromDb(): void {
   providers = listProviders().filter((p) => p.enabled === 1);
+  // 프로바이더 id가 바뀌었으면 정규식 캐시 정리
+  const ids = new Set(providers.map((p) => p.id));
+  for (const k of regexCache.keys()) if (!ids.has(k)) regexCache.delete(k);
   for (const p of providers) {
     pools[p.id] = listAccounts(p.id as any).map((a) => ({
       acct: a.slot,
@@ -82,8 +99,11 @@ function pick(providerId: string, sessionId: string): PoolEntry | null {
 // ChatGPT Responses 페이로드 정규화 (chatgpt 프로바이더 전용)
 function normalizeChatgptBody(body: Buffer): Buffer {
   if (!body || !body.length) return body;
+  const s = body.toString('utf8');
+  // 대부분의 요청은 건드릴 게 없음 — 문자열 빠른 체크 후 스킵
+  if (!s.includes('max_output_tokens') && s.includes('"store"')) return body;
   try {
-    const payload = JSON.parse(body.toString('utf8')) as Record<string, unknown>;
+    const payload = JSON.parse(s) as Record<string, unknown>;
     let changed = false;
     if ('max_output_tokens' in payload) {
       delete payload.max_output_tokens;
@@ -139,6 +159,7 @@ function forward(
       method: req.method,
       path: upstreamPath,
       headers,
+      agent,
     },
     (up) => {
       const retriable = up.statusCode === 401 || up.statusCode === 429;
@@ -169,12 +190,16 @@ function routeFor(path: string, body: Buffer): Route | null {
   if (path.startsWith('/v1/')) {
     const rest = path.slice('/v1'.length);
     let model = '';
+    // 바디에서 model 필드만 추출 — 전체 JSON.parse는 최소화
     try {
-      model = (JSON.parse(body.toString('utf8')) as { model?: string }).model ?? '';
+      const s = body.toString('utf8');
+      // "model":"..." 패턴만 빠르게 추출
+      const m = s.match(/"model"\s*:\s*"([^"]+)"/);
+      model = m ? m[1]! : '';
     } catch {}
         for (const p of providers) {
       try {
-        if (new RegExp(p.model_pattern).test(model)) {
+        if (patternRe(p).test(model)) {
           // chatgpt는 Responses/모델 카탈로그만 (chat/completions 미지원)
           if (p.id === 'chatgpt' && rest !== '/responses' && rest !== '/models') {
             return { providerId: p.id, path, unsupported: true };
