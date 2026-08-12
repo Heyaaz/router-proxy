@@ -1,12 +1,11 @@
 #!/bin/bash
 # 계정 추가/교체: ~/.cc-accounts/add-account.sh <a|b|c> [apiKey]
 #  - apiKey 인자 없이 실행하면: 브라우저 로그인 안내 → 로그인 후 auth.json에서 키 추출
-#  - apiKey를 인자로 주면: 그냥 그 키를 슬롯에 저장
+#  - apiKey를 인자로 주면: 그냥 그 키를 accounts.db에 저장
 set -euo pipefail
 
 SLOT="${1:?usage: add-account.sh <a|b|c> [apiKey]}"
-DIR="$HOME/.cc-accounts"
-mkdir -p "$DIR/$SLOT"
+DB="$HOME/.codex-accounts/db.ts"
 
 if [[ $# -ge 2 ]]; then
   KEY="$2"
@@ -24,6 +23,5 @@ else
   KEY=$(node -e "const j=require(process.env.HOME+'/.commandcode/auth.json'); process.stdout.write(j.apiKey||'')")
 fi
 
-echo "$KEY" > "$DIR/$SLOT/key"
-chmod 600 "$DIR/$SLOT/key"
-echo "✔ $SLOT 저장됨: ${KEY:0:8}...${KEY: -4} (프록시가 5초 내 자동 로드)"
+node --no-warnings "$DB" add-commandcode "$SLOT" "$KEY"
+echo "✔ $SLOT 저장됨 (accounts.db, 프록시가 5초 내 자동 로드)"

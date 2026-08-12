@@ -13,16 +13,13 @@
 // 설정: CODEX_ACCOUNTS_DIR (기본 ~/Documents/codex-accounts)
 // 의존성: Node 18+ (내장 fetch/crypto만 사용)
 
-import { createHash, randomUUID, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { initDb, listAccounts, upsertAccount } from './db.ts';
 
 const AUTH_BASE = 'https://auth.openai.com';
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const REDIRECT_URI = 'http://localhost:1455/auth/callback';
 const VERIFY_URL = `${AUTH_BASE}/codex/device`;
-const OUT_DIR = process.env.CODEX_ACCOUNTS_DIR ?? `${homedir()}/Documents/codex-accounts`;
 const SLOTS = ['a', 'b', 'c'];
 const DEFAULT_EXPIRES = 900;
 // Cloudflare가 기본 UA 차단(530 cf_route_error) → 브라우저 UA 필수
@@ -147,9 +144,11 @@ function main(): void {
     console.error(`슬롯은 a/b/c 중 하나 (기본: 빈 슬롯 자동) — 받은 값: ${slot}`);
     process.exit(2);
   }
+  initDb();
+  const existing = new Set(listAccounts('chatgpt').map((a) => a.slot));
   let target = slot;
   if (target === null) {
-    target = SLOTS.find((s) => !existsSync(join(OUT_DIR, s, 'token'))) ?? null;
+    target = SLOTS.find((s) => !existing.has(s)) ?? null;
     if (target === null) {
       console.error('모든 슬롯(a/b/c)이 사용 중 — 덮어쓸 슬롯을 인자로 지정하세요');
       process.exit(2);
@@ -169,22 +168,18 @@ function main(): void {
       const email = claims.email ?? `slot-${target}`;
       const installId = randomUUID();
 
-      const slotDir = join(OUT_DIR, target);
-      mkdirSync(slotDir, { recursive: true });
-      const files = {
-        token: tokens.access_token,
-        refresh: tokens.refresh_token,
-        id: accountId,
-        'install-id': installId,
+      upsertAccount({
+        pool: 'chatgpt',
+        slot: target,
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        accountId,
+        installId,
         email,
-      };
-      for (const [name, value] of Object.entries(files)) {
-        const p = join(slotDir, name);
-        writeFileSync(p, value);
-        chmodSync(p, 0o600);
-      }
-      console.log(`[${target}] ${email} (${claims.plan ?? 'unknown'}) 등록 완료 → ${slotDir}`);
-      console.log("프록시는 5초 내 핫리로드됨 (proxy.log에서 'chatgpt reloaded' 확인)");
+        planType: claims.plan,
+      });
+      console.log(`[${target}] ${email} (${claims.plan ?? 'unknown'}) 등록 완료 → accounts.db`);
+      console.log("프록시는 5초 내 핫리로드됨 (proxy.log에서 로드 확인)");
     })
     .catch((err) => {
       console.error(`실패: ${err.message}`);

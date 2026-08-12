@@ -2,29 +2,39 @@
 
 Local LLM account-pool routing/rotation proxy with path- and model-based routing.
 Runs entirely relative to `$HOME` (no hardcoded absolute paths), so it installs
-identically on any macOS machine. No codex-lb dependency — account login and
-token refresh are handled by the bundled Node scripts (the only runtime
-requirement is Node).
+identically on any macOS machine. No codex-lb dependency — account login, token
+refresh, and usage collection are handled by the bundled Node scripts (the only
+runtime requirement is Node 18+, Node 23+ recommended for type stripping).
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
 | `cc-accounts/` | Command Code GOAT subscription proxy (:9090) — `proxy.ts`, `add-account.sh`, `cc` |
-| `codex-accounts/` | Unified routing proxy (:9091) — `proxy.ts`, `login.ts`, `export-tokens.ts` |
+| `codex-accounts/` | Unified routing proxy (:9091) — `proxy.ts`, `login.ts`, `export-tokens.ts`, `quota.ts`, `db.ts` |
 | `launchd/` | LaunchAgent plist templates (`__HOME__` placeholder, rendered to `$HOME` at install time) |
 | `install.sh` | Install / uninstall script |
 
-## Requirements
+## Storage (SQLite)
 
-- macOS with launchd (or run the proxies manually with `node`)
-- Node 18+ (Node 23+ recommended — proxies run as `.ts` via native type stripping, no build step)
-  - `node:sqlite` (used only by the legacy codex-lb import mode) needs Node 22.5+
+All credentials and usage data live in a single SQLite database:
+
+```
+~/Documents/codex-accounts/accounts.db    ← accounts (Fernet-encrypted) + usage snapshots
+~/Documents/codex-accounts/encryption.key ← Fernet key (separate, chmod 600)
+```
+
+- **accounts** table: ChatGPT OAuth tokens (access/refresh) + Command Code keys,
+  encrypted with Fernet (AES-128-CBC + HMAC-SHA256) using the separate key file.
+- **usage_snapshots** table: per-account usage history (used %, reset time, window)
+  collected every 5 minutes by the `quota` LaunchAgent.
+
+No secrets in git — the repo contains code/templates only.
 
 ## Install
 
 ```bash
-./install.sh               # install both proxies + register launchd agents
+./install.sh               # install both proxies + quota collector + launchd agents
 ./install.sh --dry-run     # show what would happen, change nothing
 ./install.sh --uninstall   # remove launchd agents/plists (keep scripts and data)
 ```
@@ -34,7 +44,7 @@ Install targets (all under `$HOME`):
 - Scripts: `~/.cc-accounts/`, `~/.codex-accounts/` — launchd executes them from here
   (macOS TCC blocks launchd from spawning scripts under `~/Documents`)
 - Plists: `~/Library/LaunchAgents/`
-- Data: `~/Documents/codex-accounts/{a,b,c}/` — tokens (unaffected by TCC)
+- Data: `~/Documents/codex-accounts/` — `accounts.db` + `encryption.key`
 
 ## Add a ChatGPT account
 
@@ -46,37 +56,51 @@ node ~/.codex-accounts/login.ts b        # overwrite a specific slot
 ```
 
 The script prints a device code: open https://auth.openai.com/codex/device in a
-browser, enter the code, done. On success the slot gets `token` / `refresh` /
-`id` / `install-id` / `email` files. (This is the codex-lb OAuth flow, ported
-1:1 — exchanges `authorization_code` via PKCE when the endpoint returns one.)
+browser, enter the code, done. On success the account is stored encrypted in
+`accounts.db`. (This is the codex-lb OAuth flow, ported 1:1 — exchanges
+`authorization_code` via PKCE when the endpoint returns one.)
 
 ## Refresh tokens
 
 > Requires Node 18+ (same runtime as the proxies)
 
 ```bash
-node ~/.codex-accounts/export-tokens.ts --refresh   # refresh every slot (built-ins only)
+node ~/.codex-accounts/export-tokens.ts --refresh   # refresh every account (built-ins only)
 ```
 
 Refresh tokens are single-use, so a refresh rotates and persists both
-`token` and `refresh`. If a refresh fails (account expired), re-register with
-`login.ts`.
-
-### Migrate from a legacy codex-lb install (optional)
-
-Run once on a machine that previously used codex-lb to import its accounts
-(handled with Node built-ins `node:sqlite` / `node:crypto`):
-
-```bash
-node ~/.codex-accounts/export-tokens.ts
-#   CODEX_LB_DATA_DIR   codex-lb data directory (default ~/.codex-lb)
-```
+`token` and `refresh` in `accounts.db`. If a refresh fails (account expired),
+re-register with `login.ts`.
 
 ## Add Command Code keys
 
 ```bash
-~/.cc-accounts/add-account.sh a sk-...   # or drop a key file in a/b/ manually
+~/.cc-accounts/add-account.sh a sk-...   # stores key encrypted in accounts.db
+~/.cc-accounts/add-account.sh b          # browser login flow (cmd login)
 ```
+
+## Usage collection & routing (quota-aware rotation)
+
+The `quota` LaunchAgent (every 5 minutes) fetches usage from both pools:
+
+- ChatGPT: `GET https://chatgpt.com/backend-api/wham/usage` (Bearer + account-id)
+- Command Code: `GET https://api.commandcode.ai/alpha/whoami` +
+  `GET https://api.commandcode.ai/alpha/billing/credits` (x-api-key)
+
+Snapshots are stored in `usage_snapshots`. The proxies score each account as:
+
+```
+score = remaining% / max(time_to_reset, 60s)
+```
+
+Higher score = more remaining quota per second until reset → accounts whose
+quota resets soon with plenty left are used first (no wasted quota). Session
+requests stay pinned via `x-session-id` hash (skipping exhausted accounts);
+stateless requests use score-weighted random selection; 401/429 retry once with
+the next account in the same pool.
+
+Manual collection: `node ~/.codex-accounts/quota.ts` (one-shot)
+CLI helpers: `node ~/.codex-accounts/db.ts list|usage`
 
 ## Routing rules (:9091)
 
@@ -94,14 +118,16 @@ the model routing.
 | Variable | Default | Purpose |
 |---|---|---|
 | `CC_PROXY_PORT` | `9091` | Unified proxy port |
-| `CODEX_ACCOUNTS_DIR` | `~/Documents/codex-accounts` | ChatGPT token slot directory |
-| `CODEX_LB_DATA_DIR` | `~/.codex-lb` | (import mode only) codex-lb data directory |
+| `CODEX_ACCOUNTS_DIR` | `~/Documents/codex-accounts` | SQLite DB + encryption.key directory |
+| `CODEX_ACCOUNTS_DB` | `$CODEX_ACCOUNTS_DIR/accounts.db` | Override DB path |
+| `CODEX_ACCOUNTS_KEY` | `$CODEX_ACCOUNTS_DIR/encryption.key` | Override key path |
 
 ## Notes
 
-- Keys/tokens are never stored in this repository — they are read from files at
-  runtime and live outside the repo.
+- Keys/tokens are stored **encrypted** in `accounts.db`; the Fernet key is in a
+  separate `encryption.key` file (chmod 600). Never commit either to git.
 - launchd requires absolute paths, so plists are rendered from `__HOME__`
   templates at install time.
 - auth.openai.com's Cloudflare blocks default HTTP client user agents (HTTP 530
   `cf_route_error`); the scripts send a browser user agent.
+- `node:sqlite` is experimental in Node — warnings are harmless.

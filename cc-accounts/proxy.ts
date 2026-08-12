@@ -1,48 +1,68 @@
 #!/usr/bin/env node
-// Command Code 계정 로테이션 프록시 (codex-lb 스타일)
-// - 키 목록: ~/.cc-accounts/{a,b,c}/key  (5초마다 핫리로드)
-// - 세션 고정: x-session-id 해시로 계정 선택 (한 대화는 한 계정 유지)
-// - 무상태 요청: 라운드로빈
-// - 401/429 발생 시 다음 계정으로 1회 재시도
-// - 사용: COMMANDCODE_SANDBOX=true COMMANDCODE_API_URL=http://127.0.0.1:9090 cmd ...
-// - 실행: node ~/.cc-accounts/proxy.ts  (Node 23+ 타입 스트리핑 — 빌드 불필요)
+// Command Code 계정 라우팅 프록시 (SQLite 기반, codex-lb 스타일)
+// - 계정: accounts.db(commandcode) — billing/credits 사용량 스코어링
+// - 세션 고정: x-session-id 해시 (쿼터 소진 계정 제외)
+// - 무상태: 사용량 스코어 가중 랜덤 (데이터 없으면 라운드로빈)
+// - 401/429 → 다음 계정 1회 재시도
+// - 5초 핫리로드 (add-account/login 반영)
+//
+// 사용: COMMANDCODE_SANDBOX=true COMMANDCODE_API_URL=http://127.0.0.1:9090 cmd ...
+// 실행: node ~/.cc-accounts/proxy.ts  (포트: CC_PROXY_PORT ?? 9090)
 
 import http from 'node:http';
 import https from 'node:https';
-import { readFileSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { initDb, listAccounts, latestUsage } from './db.ts';
 
 type KeyEntry = { acct: string; key: string };
 
-const DIR = `${homedir()}/.cc-accounts`;
 const PORT = Number(process.env.CC_PROXY_PORT ?? 9090);
 const UPSTREAM = { hostname: 'api.commandcode.ai', port: 443 };
 
 const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}` : '***');
 
-function loadKeys(): KeyEntry[] {
-  const keys: KeyEntry[] = [];
-  for (const acct of ['a', 'b', 'c']) {
-    const p = `${DIR}/${acct}/key`;
-    if (existsSync(p)) {
-      const key = readFileSync(p, 'utf8').trim();
-      if (key) keys.push({ acct, key });
-    }
-  }
-  return keys;
-}
+initDb();
+let keys: KeyEntry[] = [];
+let usage = latestUsage();
 
-let keys = loadKeys();
+function loadFromDb(): void {
+  keys = listAccounts('commandcode').map((a) => ({ acct: a.slot, key: a.access_token ?? '' })).filter((k) => k.key);
+  usage = latestUsage();
+}
+loadFromDb();
+
 let rr = 0;
+
+function scoreOf(slot: string, now: number): number {
+  const u = usage[`commandcode:${slot}`];
+  if (!u) return 0;
+  const win = u.weekly ? 'weekly' : 'fiveHour';
+  const w = u[win];
+  if (!w) return 0;
+  const remaining = Math.max(0, 100 - w.used_percent);
+  if (remaining <= 0) return 0;
+  const ttr = w.reset_at ? Math.max(60, w.reset_at - now) : 7 * 86400;
+  return remaining / ttr;
+}
 
 function pick(sessionId: string): KeyEntry | null {
   if (keys.length === 0) return null;
+  const now = Date.now() / 1000;
+  const scored = keys.map((k) => ({ e: k, s: scoreOf(k.acct, now) }));
+  const usable = scored.filter((x) => x.s > 0);
+  const source = usable.length > 0 ? usable : scored;
   if (sessionId) {
     const h = parseInt(createHash('sha1').update(sessionId).digest('hex').slice(0, 8), 16);
-    return keys[h % keys.length]!;
+    return source[h % source.length]!.e;
   }
-  return keys[rr++ % keys.length]!;
+  const total = source.reduce((a, x) => a + x.s, 0);
+  if (total <= 0) return keys[rr++ % keys.length]!;
+  let r = Math.random() * total;
+  for (const x of source) {
+    r -= x.s;
+    if (r <= 0) return x.e;
+  }
+  return source[source.length - 1]!.e;
 }
 
 function forward(
@@ -90,7 +110,7 @@ http
       const sessionId = (req.headers['x-session-id'] as string | undefined) ?? '';
       const chosen = pick(sessionId);
       if (!chosen) {
-        res.writeHead(503).end('no account keys in ~/.cc-accounts/{a,b,c}/key');
+        res.writeHead(503).end('no commandcode accounts in accounts.db');
         return;
       }
       const next = () => {
@@ -104,11 +124,5 @@ http
     console.log(
       `cc-proxy on http://127.0.0.1:${PORT} accounts=${keys.map((k) => `${k.acct}:${mask(k.key)}`).join(', ')}`,
     );
-    setInterval(() => {
-      const fresh = loadKeys();
-      if (fresh.length !== keys.length || fresh.some((k, i) => k.key !== keys[i]?.key)) {
-        keys = fresh;
-        console.log(`${new Date().toISOString()} accounts reloaded: ${keys.map((k) => k.acct).join(', ')}`);
-      }
-    }, 5000);
+    setInterval(loadFromDb, 5000);
   });
