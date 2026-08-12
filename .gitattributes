@@ -1,0 +1,2 @@
+# node shebang(#!) 때문에 Linguist가 .ts를 JavaScript로 오분류함 → TypeScript 강제
+*.ts linguist-language=TypeScript
