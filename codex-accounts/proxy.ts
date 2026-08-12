@@ -138,7 +138,9 @@ function forward(
   delete headers.authorization;
   delete headers['x-api-key'];
   delete headers['content-length'];
-  if (provider.auth_header.toLowerCase() === 'authorization') {
+  if (provider.auth_mode === 'none') {
+    // 인증 없음 (로컬 Ollama/LM Studio 등) — 토큰 불필요
+  } else if (provider.auth_header.toLowerCase() === 'authorization') {
     headers.authorization = `Bearer ${chosen.token}`;
     if (provider.account_id_header && chosen.accountId) headers[provider.account_id_header] = chosen.accountId;
     if (provider.id === 'chatgpt' && chosen.installId) headers['x-codex-installation-id'] = chosen.installId;

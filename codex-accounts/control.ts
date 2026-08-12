@@ -15,10 +15,96 @@ import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 import { initDb, listAccounts, latestUsage, setAccountEnabled, setAccountWeight, updateAccountLabel, deleteAccount, setAccountBurn, listProviders, upsertProvider, deleteProvider, upsertAccount } from './db.ts';
 import type { Pool } from './db.ts';
 
 const PORT = Number(process.env.CONTROL_PORT ?? 9092);
+
+// ---------- OAuth 디바이스 플로우 (login.ts와 동일한 실제 ChatGPT PKCE) ----------
+const AUTH_BASE = 'https://auth.openai.com';
+const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const REDIRECT_URI = 'http://localhost:1455/auth/callback';
+const VERIFY_URL = `${AUTH_BASE}/codex/device`;
+const BROWSER_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+type OAuthSession = {
+  providerId: string;
+  deviceAuthId: string;
+  userCode: string;
+  interval: number;
+  expiresIn: number;
+  deadline: number;
+  slot: string;
+  pending: boolean;
+  done: boolean;
+};
+const oauthSessions = new Map<string, OAuthSession>();
+
+async function oauthPost(url: string, payload: Record<string, string>, { form = false } = {}): Promise<{ status: number; data: Record<string, any> }> {
+  const headers: Record<string, string> = { 'User-Agent': BROWSER_UA };
+  let body: string;
+  if (form) {
+    headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    body = new URLSearchParams(payload).toString();
+  } else {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(payload);
+  }
+  const res = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(30000) });
+  const text = await res.text();
+  let data: Record<string, any>;
+  try { data = JSON.parse(text); } catch { data = { error: text.slice(0, 300) }; }
+  return { status: res.status, data };
+}
+
+function oauthPending(data: Record<string, any>): boolean {
+  const err = data.error ?? {};
+  const code = typeof err === 'object' ? String(err.code ?? '') : String(err);
+  const status = String(data.status ?? '').toLowerCase();
+  return code.toLowerCase() === 'authorization_pending' || code.toLowerCase() === 'slow_down' ||
+    status === 'pending' || status === 'authorization_pending';
+}
+
+function oauthErrorCode(data: Record<string, any>): string {
+  const err = data.error ?? {};
+  return typeof err === 'object' ? String(err.code ?? err.message ?? '') : String(err);
+}
+
+function decodeIdToken(idToken: string): { email: string | null; accountId: string | null; plan: string | null } {
+  try {
+    const payload = idToken.split('.')[1]!;
+    const json = Buffer.from(payload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const claims = JSON.parse(json) as Record<string, any>;
+    const auth = claims['https://api.openai.com/auth'] ?? {};
+    return {
+      email: claims.email ?? null,
+      accountId: auth.chatgpt_account_id ?? claims.chatgpt_account_id ?? null,
+      plan: auth.chatgpt_plan_type ?? claims.chatgpt_plan_type ?? null,
+    };
+  } catch {
+    return { email: null, accountId: null, plan: null };
+  }
+}
+
+// ---------- 업체 프리셋 (빠른 추가용) ----------
+// authMode: api-key | bearer | oauth | none
+const PRESETS: Record<string, {
+  name: string; baseUrl: string; pathPrefix: string; authHeader: string; authMode: string;
+  modelPattern?: string; accountIdHeader?: string | null;
+}> = {
+  'opencode-go': { name: 'OpenCode Go', baseUrl: 'https://api.opencode.ai', pathPrefix: '/v1', authHeader: 'authorization', authMode: 'bearer', modelPattern: '^opencode' },
+  deepseek: { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com', pathPrefix: '/v1', authHeader: 'authorization', authMode: 'bearer', modelPattern: '^deepseek' },
+  kimi: { name: 'Kimi (Moonshot)', baseUrl: 'https://api.moonshot.cn', pathPrefix: '/v1', authHeader: 'authorization', authMode: 'bearer', modelPattern: '^kimi|^moonshot' },
+  groq: { name: 'Groq', baseUrl: 'https://api.groq.com/openai', pathPrefix: '/v1', authHeader: 'authorization', authMode: 'bearer', modelPattern: '.*' },
+  openrouter: { name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api', pathPrefix: '/v1', authHeader: 'authorization', authMode: 'bearer', modelPattern: '.*' },
+  ollama: { name: 'Ollama (로컬)', baseUrl: 'http://127.0.0.1:11434', pathPrefix: '/v1', authHeader: 'authorization', authMode: 'none', modelPattern: '.*' },
+  'lm-studio': { name: 'LM Studio (로컬)', baseUrl: 'http://127.0.0.1:1234', pathPrefix: '/v1', authHeader: 'authorization', authMode: 'none', modelPattern: '.*' },
+  'command-code': { name: 'Command Code', baseUrl: 'https://api.commandcode.ai', pathPrefix: '/provider/v1', authHeader: 'x-api-key', authMode: 'api-key', modelPattern: '.*' },
+};
+
+// ---------- OAuth 디바이스 코드 진행 상태 (인메모리, 108줄의 낡은 선언 제거) ----------
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(data));
@@ -104,6 +190,108 @@ http
         });
       } else if (req.method === 'GET' && path === '/api/providers') {
         json(res, 200, { providers: listProviders() });
+      } else if (req.method === 'GET' && path === '/api/presets') {
+        json(res, 200, { presets: Object.entries(PRESETS).map(([id, p]) => ({ id, ...p })) });
+      } else if (req.method === 'POST' && path === '/api/providers/preset') {
+        const body = await readBody(req);
+        const preset = PRESETS[String(body.id ?? '')];
+        if (!preset) return json(res, 404, { error: 'unknown preset: ' + body.id });
+        upsertProvider({ ...preset, id: String(body.id) });
+        json(res, 200, { ok: true, id: String(body.id), ...preset });
+      } else if (req.method === 'POST' && path === '/api/oauth/start') {
+        // OAuth 디바이스 코드 시작: {providerId, slot} → {userCode, verificationUri, interval, expiresIn}
+        const body = await readBody(req);
+        const pid = String(body.providerId ?? '');
+        const slot = String(body.slot ?? 'a');
+        const provider = listProviders().find((p) => p.id === pid);
+        if (!provider) return json(res, 404, { error: 'provider not found: ' + pid });
+        if (provider.auth_mode !== 'oauth') return json(res, 400, { error: pid + ' is not oauth provider' });
+        try {
+          const { status, data } = await oauthPost(`${AUTH_BASE}/api/accounts/deviceauth/usercode`, { client_id: CLIENT_ID });
+          if (status >= 400) throw new Error(`deviceauth/usercode HTTP ${status}: ${JSON.stringify(data)}`);
+          const userCode = String(data.user_code ?? '');
+          const deviceAuthId = String(data.device_auth_id ?? '');
+          if (!userCode || !deviceAuthId) throw new Error('deviceauth 응답 필드 누락');
+          const interval = Math.max(Number(data.interval ?? 5) || 5, 1);
+          let expiresIn = Number(data.expires_in ?? 0) || 0;
+          if (expiresIn <= 0) {
+            const at = Number(data.expires_at);
+            expiresIn = Number.isFinite(at) && at > 0 ? Math.max(Math.floor(at / 1000 - Date.now() / 1000), 1) : 900;
+          }
+          oauthSessions.set(pid, {
+            providerId: pid, deviceAuthId, userCode, interval, expiresIn,
+            deadline: Date.now() + expiresIn * 1000, slot, pending: true, done: false,
+          });
+          json(res, 200, { providerId: pid, userCode, verificationUri: VERIFY_URL, interval, expiresIn });
+        } catch (e: any) {
+          json(res, 502, { error: 'device code failed: ' + e.message });
+        }
+      } else if (req.method === 'POST' && path === '/api/oauth/poll') {
+        // 폴링: {providerId} → 완료 시 {ok, slot} 아니면 pending
+        const body = await readBody(req);
+        const pid = String(body.providerId ?? '');
+        const s = oauthSessions.get(pid);
+        if (!s || s.done) return json(res, 404, { error: 'no active oauth session for ' + pid });
+        if (Date.now() > s.deadline) {
+          oauthSessions.delete(pid);
+          return json(res, 400, { error: 'expired' });
+        }
+        try {
+          const { status, data } = await oauthPost(
+            `${AUTH_BASE}/api/accounts/deviceauth/token`,
+            { device_auth_id: s.deviceAuthId, user_code: s.userCode },
+          );
+          if (status === 403 || status === 404) {
+            const code = oauthErrorCode(data).toLowerCase();
+            if (code.includes('expired') || code.includes('denied') || code.includes('invalid') || code.includes('cancel')) {
+              oauthSessions.delete(pid);
+              return json(res, 400, { error: 'denied or expired (' + code + ')' });
+            }
+            return json(res, 202, { pending: true, interval: s.interval });
+          }
+          if (status >= 400) {
+            if (oauthPending(data)) return json(res, 202, { pending: true, interval: s.interval });
+            oauthSessions.delete(pid);
+            return json(res, 400, { error: 'deviceauth/token HTTP ' + status });
+          }
+          let tokens: Record<string, any> | null = null;
+          if (data.authorization_code && data.code_verifier) {
+            // PKCE 교환
+            const r = await oauthPost(
+              `${AUTH_BASE}/oauth/token`,
+              { grant_type: 'authorization_code', client_id: CLIENT_ID, code: String(data.authorization_code), code_verifier: String(data.code_verifier), redirect_uri: REDIRECT_URI },
+              { form: true },
+            );
+            if (r.status >= 400) {
+              oauthSessions.delete(pid);
+              return json(res, 400, { error: 'oauth/token HTTP ' + r.status });
+            }
+            tokens = r.data;
+          } else if (data.access_token && data.refresh_token && data.id_token) {
+            tokens = data;
+          } else if (oauthPending(data)) {
+            return json(res, 202, { pending: true, interval: s.interval });
+          } else {
+            oauthSessions.delete(pid);
+            return json(res, 400, { error: 'deviceauth/token 응답 해석 불가' });
+          }
+          const claims = decodeIdToken(String(tokens.id_token ?? ''));
+          upsertAccount({
+            pool: pid as Pool,
+            slot: s.slot,
+            accessToken: String(tokens.access_token),
+            refreshToken: tokens.refresh_token ? String(tokens.refresh_token) : null,
+            accountId: String(tokens.account_id ?? claims.accountId ?? ''),
+            email: claims.email ?? `slot-${s.slot}`,
+            installId: randomUUID(),
+            planType: claims.plan,
+          });
+          s.done = true;
+          oauthSessions.delete(pid);
+          json(res, 200, { ok: true, providerId: pid, slot: s.slot });
+        } catch (e: any) {
+          json(res, 502, { error: 'poll failed: ' + e.message });
+        }
       } else if (req.method === 'POST' && path === '/api/providers') {
         const body = await readBody(req);
         if (!body.id || !body.name || !body.baseUrl) return json(res, 400, { error: 'id, name, baseUrl required' });

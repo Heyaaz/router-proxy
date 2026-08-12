@@ -56,19 +56,26 @@ button.danger:hover{border-color:var(--red);color:var(--red)}
 <section class="col" id="providers-col">
   <h2>서빙 업체<span class="count" id="providers-count"></span></h2>
   <div id="providers-list"></div>
-  <div class="row3" style="margin-top:10px">
-    <input type="text" id="p-name" placeholder="업체 이름 (예: OpenCode Go)" style="flex:1">
-    <button id="p-add">업체 추가</button>
-  </div>
-  <div class="row3" style="margin-top:6px">
-    <input type="text" id="p-base" placeholder="API 주소 (https://api.example.com)" style="flex:1">
-    <select id="p-auth" style="background:#0d1117;border:1px solid var(--line);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
-      <option value="x-api-key">x-api-key</option>
-      <option value="authorization">Bearer</option>
-    </select>
-  </div>
-  <details style="margin-top:6px">
-    <summary style="cursor:pointer;color:var(--dim);font-size:12px">고급 옵션</summary>
+  <details open style="margin-top:10px;border-top:1px solid var(--line);padding-top:10px">
+    <summary style="cursor:pointer;color:var(--dim);font-size:12px">⚡ 빠른 추가 (프리셋)</summary>
+    <div class="row3" style="margin-top:6px">
+      <select id="p-preset" style="background:#0d1117;border:1px solid var(--line);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px;flex:1"></select>
+      <button id="p-preset-add">추가</button>
+    </div>
+  </details>
+  <details style="margin-top:10px;border-top:1px solid var(--line);padding-top:10px">
+    <summary style="cursor:pointer;color:var(--dim);font-size:12px">직접 추가 (커스텀)</summary>
+    <div class="row3" style="margin-top:6px">
+      <input type="text" id="p-name" placeholder="업체 이름 (예: OpenCode Go)" style="flex:1">
+      <button id="p-add">업체 추가</button>
+    </div>
+    <div class="row3" style="margin-top:6px">
+      <input type="text" id="p-base" placeholder="API 주소 (https://api.example.com)" style="flex:1">
+      <select id="p-auth" style="background:#0d1117;border:1px solid var(--line);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
+        <option value="x-api-key">x-api-key</option>
+        <option value="authorization">Bearer</option>
+      </select>
+    </div>
     <div class="row3" style="margin-top:6px">
       <input type="text" id="p-prefix" placeholder="경로 (/provider/v1)" style="flex:1">
     </div>
@@ -86,8 +93,14 @@ button.danger:hover{border-color:var(--red);color:var(--red)}
     <input type="text" id="p-slot" placeholder="슬롯 (a)" style="width:60px">
     <input type="text" id="p-token" placeholder="토큰/키" style="flex:1">
     <button id="p-add-acc">계정 추가</button>
+    <button id="p-oauth" title="OAuth 디바이스 로그인" style="background:#1f6feb;color:#fff">OAuth</button>
   </div>
 </section>
+<div id="oauth-box" style="display:none;margin-top:10px;padding:10px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;font-size:13px">
+  <b>OAuth 로그인</b> — 이 주소에서 코드 <span id="oauth-code" style="font-weight:700;color:var(--blue)"></span> 입력:<br>
+  <a id="oauth-url" href="#" target="_blank" style="color:var(--blue)"></a><br>
+  <span style="color:var(--dim)">승인하면 자동으로 계정이 추가됩니다…</span>
+</div>
 <div class="err" id="err"></div>
 <script>
 const $ = (s) => document.querySelector(s);
@@ -275,8 +288,62 @@ $('#p-add-acc').addEventListener('click', async () => {
   } catch(e){ err.textContent = '계정 추가 실패: ' + e.message; }
 });
 
+// 빠른 추가 (프리셋)
+let presets = [];
+let oauthTimer = null;
+async function loadPresets(){
+  try {
+    const d = await api('/api/presets');
+    presets = d.presets || [];
+    const sel = $('#p-preset');
+    sel.innerHTML = presets.map(p => `<option value="${p.id}">${p.name}</option>`).join('') || '<option value="">프리셋 없음</option>';
+  } catch(e){ /* 조용히 */ }
+}
+$('#p-preset-add').addEventListener('click', async () => {
+  const id = $('#p-preset').value;
+  if (!id) { err.textContent = '프리셋 선택 필요'; return; }
+  try {
+    await api('/api/providers/preset', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
+    load();
+  } catch(e){ err.textContent = '프리셋 추가 실패: ' + e.message; }
+});
+
+// OAuth 디바이스 로그인
+$('#p-oauth').addEventListener('click', async () => {
+  const providerId = $('#p-provider').value;
+  if (!providerId) { err.textContent = '업체 선택 필요'; return; }
+  const slot = $('#p-slot').value.trim() || 'a';
+  try {
+    const d = await api('/api/oauth/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ providerId, slot }) });
+    $('#oauth-code').textContent = d.userCode;
+    $('#oauth-url').textContent = d.verificationUri;
+    $('#oauth-url').href = d.verificationUri;
+    $('#oauth-box').style.display = 'block';
+    if (oauthTimer) clearInterval(oauthTimer);
+    // 폴링: interval 초마다 토큰 확인 (202 pending이면 계속)
+    oauthTimer = setInterval(async () => {
+      try {
+        const r = await fetch('/api/oauth/poll', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ providerId }) });
+        const d2 = await r.json();
+        if (r.ok && d2.ok) {
+          clearInterval(oauthTimer); oauthTimer = null;
+          $('#oauth-box').style.display = 'none';
+          err.textContent = '';
+          $('#p-slot').value = '';
+          load();
+        } else if (!r.ok && !(r.status === 202)) {
+          clearInterval(oauthTimer); oauthTimer = null;
+          $('#oauth-box').style.display = 'none';
+          err.textContent = 'OAuth 실패: ' + (d2.error || r.status);
+        }
+      } catch(e){ /* 네트워크 오류 — 다음 틱에 재시도 */ }
+    }, Math.max(3, (d.interval || 5)) * 1000);
+  } catch(e){ err.textContent = 'OAuth 시작 실패: ' + e.message; }
+});
+
 $('#refresh').addEventListener('click', load);
 setInterval(() => { if ($('#auto').checked) load(); }, 30000);
+loadPresets();
 load();
 </script>
 </body>

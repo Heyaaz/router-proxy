@@ -20,6 +20,7 @@ export type Provider = {
   base_url: string;     // 'https://api.commandcode.ai'
   path_prefix: string;  // '/provider/v1' | '/backend-api/codex'
   auth_header: string;  // 'x-api-key' | 'authorization'
+  auth_mode: string;    // 'api-key' | 'bearer' | 'oauth' | 'none'
   account_id_header: string | null;  // 'chatgpt-account-id' 등 (선택)
   model_pattern: string; // 이 업체가 받는 모델 정규식
   enabled: number;
@@ -157,6 +158,7 @@ export function initDb(): DatabaseSync {
       base_url TEXT NOT NULL,
       path_prefix TEXT NOT NULL,
       auth_header TEXT NOT NULL DEFAULT 'x-api-key',
+      auth_mode TEXT NOT NULL DEFAULT 'api-key',
       account_id_header TEXT,
       model_pattern TEXT NOT NULL DEFAULT '.*',
       enabled INTEGER NOT NULL DEFAULT 1,
@@ -199,11 +201,17 @@ export function initDb(): DatabaseSync {
   if (!cols.some((c) => c.name === 'enabled')) db.exec(`ALTER TABLE accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`);
   if (!cols.some((c) => c.name === 'weight')) db.exec(`ALTER TABLE accounts ADD COLUMN weight REAL NOT NULL DEFAULT 1.0`);
   if (!cols.some((c) => c.name === 'burn_priority')) db.exec(`ALTER TABLE accounts ADD COLUMN burn_priority INTEGER NOT NULL DEFAULT 0`);
+  // providers.auth_mode 컬럼 마이그레이션
+  const pcols = db.prepare(`PRAGMA table_info(providers)`).all() as { name: string }[];
+  if (!pcols.some((c) => c.name === 'auth_mode')) db.exec(`ALTER TABLE providers ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'api-key'`);
+  // 기존 시드 업데이트 (INSERT OR IGNORE는 기존 행을 안 덮어쓰므로 명시 UPDATE)
+  db.prepare("UPDATE providers SET auth_mode='oauth' WHERE id='chatgpt' AND auth_mode='api-key'").run();
+
   // 기본 프로바이더 시드 (누락분만 추가)
   const now = Math.floor(Date.now() / 1000);
-  const seed = db.prepare('INSERT OR IGNORE INTO providers (id, name, base_url, path_prefix, auth_header, account_id_header, model_pattern, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?)');
-  seed.run('chatgpt', 'GPT (ChatGPT)', 'https://chatgpt.com', '/backend-api/codex', 'authorization', 'chatgpt-account-id', '^(gpt-5\\.|gpt-4\\.|o[0-9]|codex-)', 1, now);
-  seed.run('commandcode', 'Command Code', 'https://api.commandcode.ai', '/provider/v1', 'x-api-key', null, '.*', 1, now);
+  const seed = db.prepare('INSERT OR IGNORE INTO providers (id, name, base_url, path_prefix, auth_header, auth_mode, account_id_header, model_pattern, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)');
+  seed.run('chatgpt', 'GPT (ChatGPT)', 'https://chatgpt.com', '/backend-api/codex', 'authorization', 'oauth', 'chatgpt-account-id', '^(gpt-5\\.|gpt-4\\.|o[0-9]|codex-)', 1, now);
+  seed.run('commandcode', 'Command Code', 'https://api.commandcode.ai', '/provider/v1', 'x-api-key', 'api-key', null, '.*', 1, now);
   _db = db;
   _key = getOrCreateKey();
   return db;
@@ -310,6 +318,7 @@ export function listProviders(): Provider[] {
   return (rows as any[]).map((r) => ({
     id: r.id as string, name: r.name as string, base_url: r.base_url as string,
     path_prefix: r.path_prefix as string, auth_header: r.auth_header as string,
+    auth_mode: (r.auth_mode as string) ?? 'api-key',
     account_id_header: r.account_id_header ?? null, model_pattern: r.model_pattern as string,
     enabled: r.enabled as number, created_at: r.created_at as number,
   }));
@@ -321,6 +330,7 @@ export function upsertProvider(p: {
   baseUrl: string;
   pathPrefix: string;
   authHeader?: string;
+  authMode?: string;
   accountIdHeader?: string | null;
   modelPattern?: string;
   enabled?: number;
@@ -328,13 +338,13 @@ export function upsertProvider(p: {
   const db = initDb();
   const now = Math.floor(Date.now() / 1000);
   db.prepare(`
-    INSERT INTO providers (id, name, base_url, path_prefix, auth_header, account_id_header, model_pattern, enabled, created_at)
-    VALUES (?,?,?,?,?,?,?,?,?)
+    INSERT INTO providers (id, name, base_url, path_prefix, auth_header, auth_mode, account_id_header, model_pattern, enabled, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(id) DO UPDATE SET
       name=excluded.name, base_url=excluded.base_url, path_prefix=excluded.path_prefix,
-      auth_header=excluded.auth_header, account_id_header=excluded.account_id_header,
+      auth_header=excluded.auth_header, auth_mode=excluded.auth_mode, account_id_header=excluded.account_id_header,
       model_pattern=excluded.model_pattern, enabled=excluded.enabled
-  `).run(p.id, p.name, p.baseUrl, p.pathPrefix, p.authHeader ?? 'x-api-key', p.accountIdHeader ?? null, p.modelPattern ?? '.*', p.enabled ?? 1, now);
+  `).run(p.id, p.name, p.baseUrl, p.pathPrefix, p.authHeader ?? 'x-api-key', p.authMode ?? 'api-key', p.accountIdHeader ?? null, p.modelPattern ?? '.*', p.enabled ?? 1, now);
 }
 
 export function deleteProvider(id: string): void {
