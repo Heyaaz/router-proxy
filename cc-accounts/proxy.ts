@@ -14,7 +14,7 @@ import https from 'node:https';
 import { createHash } from 'node:crypto';
 import { initDb, listAccounts, latestUsage, usageScore } from './db.ts';
 
-type KeyEntry = { acct: string; key: string; enabled: number; weight: number };
+type KeyEntry = { acct: string; key: string; enabled: number; weight: number; burn: number };
 
 const PORT = Number(process.env.CC_PROXY_PORT ?? 9090);
 const UPSTREAM = { hostname: 'api.commandcode.ai', port: 443 };
@@ -26,7 +26,7 @@ let keys: KeyEntry[] = [];
 let usage = latestUsage();
 
 function loadFromDb(): void {
-  keys = listAccounts('commandcode').map((a) => ({ acct: a.slot, key: a.access_token ?? '', enabled: a.enabled, weight: a.weight })).filter((k) => k.key);
+  keys = listAccounts('commandcode').map((a) => ({ acct: a.slot, key: a.access_token ?? '', enabled: a.enabled, weight: a.weight, burn: a.burn_priority })).filter((k) => k.key);
   usage = latestUsage();
 }
 loadFromDb();
@@ -38,7 +38,7 @@ function pick(sessionId: string): KeyEntry | null {
   const now = Date.now() / 1000;
   const scored = keys
     .filter((k) => k.enabled !== 0)
-    .map((k) => ({ e: k, s: usageScore(usage, 'commandcode', k.acct, now) * (k.weight || 1) }));
+    .map((k) => ({ e: k, s: usageScore(usage, 'commandcode', k.acct, now) * (k.weight || 1) + (k.burn || 0) * 1000 }));
   const usable = scored.filter((x) => x.s > 0);
   const source = usable.length > 0 ? usable : scored;
   if (sessionId) {

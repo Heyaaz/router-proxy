@@ -16,10 +16,10 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createHash } from 'node:crypto';
-import { initDb, listAccounts, latestUsage, usageScore } from './db.ts';
+import { initDb, listAccounts, latestUsage, usageScore, listModelRoutes } from './db.ts';
 
 type PoolName = 'chatgpt' | 'commandcode';
-type PoolEntry = { acct: string; token: string; accountId?: string | null; installId?: string | null; key?: string | null; enabled: number; weight: number };
+type PoolEntry = { acct: string; token: string; accountId?: string | null; installId?: string | null; key?: string | null; enabled: number; weight: number; burn: number };
 type Route = { pool: PoolName; path: string; unsupported?: boolean };
 type RouteRule = { pool: PoolName; test: RegExp };
 type ForwardOpts = { pool: PoolName; upstream: { hostname: string; port: number; base: string }; path: string };
@@ -28,11 +28,13 @@ const PORT = Number(process.env.CC_PROXY_PORT ?? 9091);
 const CHATGPT_UPSTREAM = { hostname: 'chatgpt.com', port: 443, base: '/backend-api/codex' };
 const CC_UPSTREAM = { hostname: 'api.commandcode.ai', port: 443, base: '/provider/v1' };
 
-// /v1/* 분기 테이블: 위에서부터 첫 매치. pool: 'chatgpt' | 'commandcode'
-const MODEL_ROUTES: RouteRule[] = [
-  { pool: 'chatgpt', test: /^(gpt-5\.|gpt-4\.|o[0-9]|codex-)/ },
-  { pool: 'commandcode', test: /.*/ },
-];
+// /v1/* 분기 테이블: DB(model_routes)에서 로드. priority 낮을수록 먼저 매치.
+let MODEL_ROUTES: RouteRule[] = [];
+function loadRoutes(): void {
+  MODEL_ROUTES = listModelRoutes()
+    .filter((r) => r.enabled === 1)
+    .map((r) => ({ pool: r.pool, test: new RegExp(r.pattern) }));
+}
 
 const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}` : '***');
 
@@ -50,14 +52,17 @@ function loadFromDb(): void {
     installId: a.install_id,
     enabled: a.enabled,
     weight: a.weight,
+    burn: a.burn_priority,
   })).filter((a) => a.token);
   commandcode = listAccounts('commandcode').map((a) => ({
     acct: a.slot,
     key: a.access_token ?? '',
     enabled: a.enabled,
     weight: a.weight,
+    burn: a.burn_priority,
   })).filter((a) => a.key);
   usage = latestUsage();
+  loadRoutes();
 }
 loadFromDb();
 
@@ -70,7 +75,7 @@ function pick(pool: PoolName, sessionId: string): PoolEntry | null {
   const now = Date.now() / 1000;
   const scored = entries
     .filter((e) => e.enabled !== 0)  // 비활성 계정 제외
-    .map((e) => ({ e, s: usageScore(usage, pool, e.acct, now) * (e.weight || 1) }));
+    .map((e) => ({ e, s: usageScore(usage, pool, e.acct, now) * (e.weight || 1) + (e.burn || 0) * 1000 }));
   const usable = scored.filter((x) => x.s > 0);
   const source = usable.length > 0 ? usable : scored;
 

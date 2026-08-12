@@ -27,8 +27,17 @@ export type AccountRow = {
   plan_type: string | null;
   enabled: number;      // 1 = 활성, 0 = 비활성 (라우팅 제외)
   weight: number;       // 스코어 가중치 (기본 1.0)
+  burn_priority: number; // 수동 우선 태우기 (기본 0, 높을수록 먼저)
   created_at: number;
   updated_at: number;
+};
+export type ModelRoute = {
+  id: number;
+  pool: Pool;
+  pattern: string;      // 정규식 패턴
+  priority: number;     // 낮을수록 먼저 매치
+  enabled: number;
+  created_at: number;
 };
 export type UsageRow = {
   pool: Pool;
@@ -131,13 +140,30 @@ export function initDb(): DatabaseSync {
       window_seconds INTEGER,
       fetched_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS model_routes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pool TEXT NOT NULL CHECK (pool IN ('chatgpt','commandcode')),
+      pattern TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 100,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_usage_latest
       ON usage_snapshots(pool, slot, window, fetched_at DESC);
   `);
-  // 기존 DB 마이그레이션: enabled/weight 컬럼 추가
+  // 기존 DB 마이그레이션: enabled/weight/burn_priority 컬럼 추가
   const cols = db.prepare(`PRAGMA table_info(accounts)`).all() as { name: string }[];
   if (!cols.some((c) => c.name === 'enabled')) db.exec(`ALTER TABLE accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`);
   if (!cols.some((c) => c.name === 'weight')) db.exec(`ALTER TABLE accounts ADD COLUMN weight REAL NOT NULL DEFAULT 1.0`);
+  if (!cols.some((c) => c.name === 'burn_priority')) db.exec(`ALTER TABLE accounts ADD COLUMN burn_priority INTEGER NOT NULL DEFAULT 0`);
+  // 기본 모델 라우트 시드 (없을 때만)
+  const routeCount = (db.prepare('SELECT COUNT(*) c FROM model_routes').get() as { c: number }).c;
+  if (routeCount === 0) {
+    const now = Math.floor(Date.now() / 1000);
+    const seed = db.prepare('INSERT INTO model_routes (pool, pattern, priority, enabled, created_at) VALUES (?,?,?,?,?)');
+    seed.run('chatgpt', '^(gpt-5\\.|gpt-4\\.|o[0-9]|codex-)', 10, 1, now);
+    seed.run('commandcode', '.*', 999, 1, now);
+  }
   _db = db;
   _key = getOrCreateKey();
   return db;
@@ -226,8 +252,48 @@ export function listAccounts(pool?: Pool): AccountRow[] {
     account_id: r.account_id ?? null, email: r.email ?? null, install_id: r.install_id ?? null,
     plan_type: r.plan_type ?? null,
     enabled: (r.enabled as number) ?? 1, weight: (r.weight as number) ?? 1.0,
+    burn_priority: (r.burn_priority as number) ?? 0,
     created_at: r.created_at as number, updated_at: r.updated_at as number,
   }));
+}
+
+export function setAccountBurn(pool: Pool, slot: string, burn: number): void {
+  const db = initDb();
+  db.prepare('UPDATE accounts SET burn_priority=?, updated_at=? WHERE pool=? AND slot=?')
+    .run(burn, Math.floor(Date.now() / 1000), pool, slot);
+}
+
+// ---------- model_routes ----------
+export function listModelRoutes(): ModelRoute[] {
+  const db = initDb();
+  const rows = db.prepare('SELECT * FROM model_routes ORDER BY priority, id').all();
+  return (rows as any[]).map((r) => ({
+    id: r.id as number, pool: r.pool as Pool, pattern: r.pattern as string,
+    priority: r.priority as number, enabled: r.enabled as number, created_at: r.created_at as number,
+  }));
+}
+
+export function upsertModelRoute(r: {
+  id?: number;
+  pool: Pool;
+  pattern: string;
+  priority?: number;
+  enabled?: number;
+}): void {
+  const db = initDb();
+  const now = Math.floor(Date.now() / 1000);
+  if (r.id) {
+    db.prepare('UPDATE model_routes SET pool=?, pattern=?, priority=?, enabled=?, created_at=created_at WHERE id=?')
+      .run(r.pool, r.pattern, r.priority ?? 100, r.enabled ?? 1, r.id);
+  } else {
+    db.prepare('INSERT INTO model_routes (pool, pattern, priority, enabled, created_at) VALUES (?,?,?,?,?)')
+      .run(r.pool, r.pattern, r.priority ?? 100, r.enabled ?? 1, now);
+  }
+}
+
+export function deleteModelRoute(id: number): void {
+  const db = initDb();
+  db.prepare('DELETE FROM model_routes WHERE id=?').run(id);
 }
 
 export function deleteAccount(pool: Pool, slot: string): void {
@@ -318,5 +384,18 @@ if (args.length > 0 && args[0] !== '--help') {
   } else if (args[0] === 'del' && args[1] && args[2]) {
     deleteAccount(args[1] as Pool, args[2]);
     console.log(`${args[1]}/${args[2]} 삭제됨`);
+  } else if (args[0] === 'burn' && args[1] && args[2] && args[3]) {
+    setAccountBurn(args[1] as Pool, args[2], Number(args[3]));
+    console.log(`${args[1]}/${args[2]} 우선순위 ${args[3]}`);
+  } else if (args[0] === 'routes') {
+    for (const r of listModelRoutes()) {
+      console.log(`#${r.id} [${r.pool}] ${r.pattern} (priority=${r.priority}, ${r.enabled ? 'on' : 'off'})`);
+    }
+  } else if (args[0] === 'route-add' && args[1] && args[2]) {
+    upsertModelRoute({ pool: args[1] as Pool, pattern: args[2], priority: Number(args[3] ?? 100) });
+    console.log(`라우트 추가: ${args[1]} ${args[2]}`);
+  } else if (args[0] === 'route-del' && args[1]) {
+    deleteModelRoute(Number(args[1]));
+    console.log(`라우트 #${args[1]} 삭제`);
   }
 }

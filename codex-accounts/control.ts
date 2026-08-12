@@ -12,7 +12,10 @@
 // 사용: node ~/.codex-accounts/control.ts  (포트: CONTROL_PORT ?? 9092)
 
 import http from 'node:http';
-import { initDb, listAccounts, latestUsage, setAccountEnabled, setAccountWeight, updateAccountLabel, deleteAccount } from './db.ts';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { initDb, listAccounts, latestUsage, setAccountEnabled, setAccountWeight, updateAccountLabel, deleteAccount, setAccountBurn, listModelRoutes, upsertModelRoute, deleteModelRoute } from './db.ts';
 import type { Pool } from './db.ts';
 
 const PORT = Number(process.env.CONTROL_PORT ?? 9092);
@@ -63,6 +66,7 @@ function accountsResponse(): unknown {
         windowMinutesSecondary: w?.window_seconds ? Math.round(w.window_seconds / 60) : null,
         planType: a.plan_type,
         weight: a.weight,
+        burnPriority: a.burn_priority,
       };
     }),
   };
@@ -76,7 +80,11 @@ http
     const del = path.match(/^\/api\/accounts\/(chatgpt|commandcode)\/([a-z0-9_-]+)$/);
 
     try {
-      if (req.method === 'GET' && path === '/api/accounts') {
+      if (req.method === 'GET' && (path === '/' || path === '/index.html')) {
+        // 칸반 대시보드 (정적 HTML)
+        const html = readFileSync(process.env.CODEX_DASHBOARD ?? join(homedir(), '.codex-accounts', 'dashboard.html'));
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(html);
+      } else if (req.method === 'GET' && path === '/api/accounts') {
         json(res, 200, accountsResponse());
       } else if (req.method === 'GET' && path === '/api/usage') {
         json(res, 200, latestUsage());
@@ -90,6 +98,30 @@ http
           usageSnapshots: Object.keys(latestUsage()).length,
           ts: Date.now(),
         });
+      } else if (req.method === 'GET' && path === '/api/models') {
+        json(res, 200, { routes: listModelRoutes() });
+      } else if (req.method === 'POST' && path === '/api/models') {
+        const body = await readBody(req);
+        if (!body.pool || !body.pattern) return json(res, 400, { error: 'pool and pattern required' });
+        try { new RegExp(body.pattern); } catch { return json(res, 400, { error: 'invalid regex' }); }
+        upsertModelRoute({
+          id: body.id ? Number(body.id) : undefined,
+          pool: body.pool as Pool,
+          pattern: String(body.pattern),
+          priority: body.priority !== undefined ? Number(body.priority) : 100,
+          enabled: body.enabled !== undefined ? (body.enabled ? 1 : 0) : 1,
+        });
+        json(res, 200, { ok: true });
+      } else if (req.method === 'DELETE' && path.match(/^\/api\/models\/\d+$/)) {
+        deleteModelRoute(Number(path.split('/').pop()));
+        json(res, 200, { ok: true });
+      } else if (req.method === 'POST' && path.match(/^\/api\/accounts\/(chatgpt|commandcode)\/[a-z0-9_-]+\/burn$/)) {
+        const [, pool, slot] = path.match(/^\/api\/accounts\/(chatgpt|commandcode)\/([a-z0-9_-]+)\/burn$/)!;
+        const body = await readBody(req);
+        const burn = Number(body.burn ?? 0);
+        if (!Number.isFinite(burn) || burn < 0) return json(res, 400, { error: 'burn must be >= 0' });
+        setAccountBurn(pool as Pool, slot, burn);
+        json(res, 200, { ok: true, pool, slot, burn });
       } else if (req.method === 'POST' && m) {
         const [, pool, slot, action] = m;
         const body = await readBody(req);

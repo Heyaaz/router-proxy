@@ -53,6 +53,19 @@ button.danger:hover{border-color:var(--red);color:var(--red)}
   </div>
 </header>
 <main id="board"></main>
+<section class="col" id="models-col">
+  <h2>모델 라우트<span class="count" id="models-count"></span></h2>
+  <div id="models-list"></div>
+  <div class="row3" style="margin-top:10px">
+    <select id="m-pool" style="background:#0f1115;border:1px solid var(--line);border-radius:4px;color:var(--text);font-size:11px;padding:2px 4px">
+      <option value="chatgpt">chatgpt</option>
+      <option value="commandcode">commandcode</option>
+    </select>
+    <input type="text" id="m-pattern" placeholder="정규식" style="flex:1">
+    <input type="number" id="m-priority" value="100" style="width:48px" title="우선순위">
+    <button id="m-add">추가</button>
+  </div>
+</section>
 <div class="err" id="err"></div>
 <script>
 const $ = (s) => document.querySelector(s);
@@ -109,6 +122,7 @@ function card(a){
         ? '<button data-act="enable">재개</button>'
         : '<button data-act="disable">일시정지</button>'}
       <input type="number" step="0.1" min="0.1" value="${a.weight ?? 1}" title="가중치" data-act="weight">
+      <button data-act="burn" title="우선 태우기 (클릭할 때마다 +1, 0이면 해제)">🔥 태우기 ${(a.burnPriority ?? 0) ? '×' + a.burnPriority : ''}</button>
       <input type="text" value="${a.alias || ''}" placeholder="라벨" title="라벨" data-act="label">
       <button class="danger" data-act="del">삭제</button>
     </div>
@@ -156,6 +170,9 @@ board.addEventListener('click', async (ev) => {
   try {
     if (act === 'enable' || act === 'disable') {
       await api(`/api/accounts/${pool}/${slot}/enabled`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: act === 'enable'}) });
+    } else if (act === 'burn') {
+      const cur = (accounts.find(a => a.pool === pool && a.accountId === slot) || {}).burnPriority ?? 0;
+      await api(`/api/accounts/${pool}/${slot}/burn`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({burn: cur >= 3 ? 0 : cur + 1}) });
     } else if (act === 'del') {
       if (!confirm(`${pool}/${slot} 계정을 삭제할까요?`)) return;
       await api(`/api/accounts/${pool}/${slot}`, { method:'DELETE' });
@@ -182,9 +199,54 @@ board.addEventListener('change', async (ev) => {
   } catch(e){ err.textContent = '실패: ' + e.message; }
 });
 
-$('#refresh').addEventListener('click', load);
-setInterval(() => { if ($('#auto').checked) load(); }, 30000);
+// 모델 라우트
+let routes = [];
+async function loadModels(){
+  try {
+    const res = await api('/api/models');
+    routes = res.routes ?? [];
+    $('#models-count').textContent = routes.length;
+    $('#models-list').innerHTML = routes.map(r => `
+      <div class="card" style="margin-bottom:6px">
+        <div class="row1">
+          <span class="slot" style="font-size:11px">#${r.id}</span>
+          <span class="label" style="font-size:11px">[${r.pool}] ${r.pattern}</span>
+        </div>
+        <div class="row2">
+          <span>priority ${r.priority}</span>
+          <span>${r.enabled ? 'on' : 'off'}</span>
+        </div>
+        <div class="row3">
+          <button data-mact="del" data-id="${r.id}">삭제</button>
+        </div>
+      </div>`).join('') || '<div class="empty">라우트 없음</div>';
+  } catch(e){ $('#models-list').innerHTML = '<div class="empty">로드 실패</div>'; }
+}
+$('#m-add').addEventListener('click', async () => {
+  const pool = $('#m-pool').value, pattern = $('#m-pattern').value.trim(), priority = Number($('#m-priority').value || 100);
+  if (!pattern) return;
+  try {
+    await api('/api/models', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({pool, pattern, priority}) });
+    $('#m-pattern').value = '';
+    loadModels();
+  } catch(e){ err.textContent = '추가 실패: ' + e.message; }
+});
+$('#models-list').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-mact]');
+  if (!btn) return;
+  try {
+    if (btn.dataset.mact === 'del') {
+      if (!confirm('라우트 삭제?')) return;
+      await api(`/api/models/${btn.dataset.id}`, { method:'DELETE' });
+      loadModels();
+    }
+  } catch(e){ err.textContent = '삭제 실패: ' + e.message; }
+});
+
+$('#refresh').addEventListener('click', () => { load(); loadModels(); });
+setInterval(() => { if ($('#auto').checked) { load(); loadModels(); } }, 30000);
 load();
+loadModels();
 </script>
 </body>
 </html>
