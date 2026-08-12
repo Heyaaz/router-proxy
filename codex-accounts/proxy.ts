@@ -1,91 +1,74 @@
 #!/usr/bin/env node
-// Codex(ChatGPT 계정풀) + Command Code 통합 라우팅 프록시 (SQLite 기반)
+// 다중 프로바이더 통합 라우팅 프록시 (SQLite 기반)
 //
-// 풀 1 — ChatGPT 계정풀: accounts.db(chatgpt) — wham/usage 사용량 스코어링
-// 풀 2 — Command Code:   accounts.db(commandcode) — billing/credits 사용량 스코어링
+// 프로바이더(업체)별 계정풀:
+//   providers 테이블: id, name, base_url, path_prefix, auth_header, model_pattern
+//   accounts 테이블:  pool = provider id
 //
-// 사용량 기반 선택 (codex-lb select_account 로직 단순화):
-//   score(account) = remaining% / max(time_to_reset, 60s)
-//   → 리셋이 가까우면서 사용량이 많이 남은 계정 우선 (쿼터 소진 최적화)
-//   사용량 데이터 없으면 세션 해시/라운드로빈 폴백.
-//   세션 고정: x-session-id → 해시로 고정, 단 쿼터 소진 계정은 제외.
-//   401/429 → 같은 풀 다음 계정으로 1회 재시도.
+// 라우팅:
+//   /backend-api/codex/*  → chatgpt 프로바이더 (Codex CLI 네이티브)
+//   /provider/v1/*        → commandcode 프로바이더 (OpenAI 호환)
+//   /v1/*                 → 모델명으로 프로바이더의 model_pattern 매칭
+//
+// 사용량 기반 선택: score = remaining% / max(time_to_reset, 60s)
+//   + weight 가중치, burn_priority 우선 태우기, 세션 고정, 401/429 재시도.
 //
 // 사용: node ~/.codex-accounts/proxy.ts  (포트: CC_PROXY_PORT ?? 9091)
 
 import http from 'node:http';
 import https from 'node:https';
 import { createHash } from 'node:crypto';
-import { initDb, listAccounts, latestUsage, usageScore, listModelRoutes } from './db.ts';
+import { initDb, listAccounts, latestUsage, usageScore, listProviders } from './db.ts';
+import type { Provider } from './db.ts';
 
-type PoolName = 'chatgpt' | 'commandcode';
-type PoolEntry = { acct: string; token: string; accountId?: string | null; installId?: string | null; key?: string | null; enabled: number; weight: number; burn: number };
-type Route = { pool: PoolName; path: string; unsupported?: boolean };
-type RouteRule = { pool: PoolName; test: RegExp };
-type ForwardOpts = { pool: PoolName; upstream: { hostname: string; port: number; base: string }; path: string };
+type PoolEntry = { acct: string; token: string; accountId?: string | null; installId?: string | null; enabled: number; weight: number; burn: number };
+type Route = { providerId: string; path: string; unsupported?: boolean };
+type ForwardOpts = { provider: Provider; path: string };
 
 const PORT = Number(process.env.CC_PROXY_PORT ?? 9091);
-const CHATGPT_UPSTREAM = { hostname: 'chatgpt.com', port: 443, base: '/backend-api/codex' };
-const CC_UPSTREAM = { hostname: 'api.commandcode.ai', port: 443, base: '/provider/v1' };
-
-// /v1/* 분기 테이블: DB(model_routes)에서 로드. priority 낮을수록 먼저 매치.
-let MODEL_ROUTES: RouteRule[] = [];
-function loadRoutes(): void {
-  MODEL_ROUTES = listModelRoutes()
-    .filter((r) => r.enabled === 1)
-    .map((r) => ({ pool: r.pool, test: new RegExp(r.pattern) }));
-}
 
 const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}` : '***');
 
-// ---------- 계정/사용량 로딩 (DB) ----------
+// ---------- DB 로딩 ----------
 initDb();
-let chatgpt: PoolEntry[] = [];
-let commandcode: PoolEntry[] = [];
+let providers: Provider[] = [];
+const pools: Record<string, PoolEntry[]> = {};
 let usage = latestUsage();
 
 function loadFromDb(): void {
-  chatgpt = listAccounts('chatgpt').map((a) => ({
-    acct: a.slot,
-    token: a.access_token ?? '',
-    accountId: a.account_id,
-    installId: a.install_id,
-    enabled: a.enabled,
-    weight: a.weight,
-    burn: a.burn_priority,
-  })).filter((a) => a.token);
-  commandcode = listAccounts('commandcode').map((a) => ({
-    acct: a.slot,
-    key: a.access_token ?? '',
-    enabled: a.enabled,
-    weight: a.weight,
-    burn: a.burn_priority,
-  })).filter((a) => a.key);
+  providers = listProviders().filter((p) => p.enabled === 1);
+  for (const p of providers) {
+    pools[p.id] = listAccounts(p.id as any).map((a) => ({
+      acct: a.slot,
+      token: a.access_token ?? '',
+      accountId: a.account_id,
+      installId: a.install_id,
+      enabled: a.enabled,
+      weight: a.weight,
+      burn: a.burn_priority,
+    })).filter((a) => a.token);
+  }
   usage = latestUsage();
-  loadRoutes();
 }
 loadFromDb();
 
 let rr = 0;
 
-// 계정 선택: 세션 고정(쿼터 소진 계정 제외) + 사용량 스코어 + 라운드로빈 폴백
-function pick(pool: PoolName, sessionId: string): PoolEntry | null {
-  const entries = pool === 'chatgpt' ? chatgpt : commandcode;
+// 계정 선택: 세션 고정 + 사용량 스코어 + weight/burn
+function pick(providerId: string, sessionId: string): PoolEntry | null {
+  const entries = pools[providerId] ?? [];
   if (entries.length === 0) return null;
   const now = Date.now() / 1000;
   const scored = entries
-    .filter((e) => e.enabled !== 0)  // 비활성 계정 제외
-    .map((e) => ({ e, s: usageScore(usage, pool, e.acct, now) * (e.weight || 1) + (e.burn || 0) * 1000 }));
+    .filter((e) => e.enabled !== 0)
+    .map((e) => ({ e, s: usageScore(usage, providerId as any, e.acct, now) * (e.weight || 1) + (e.burn || 0) * 1000 }));
   const usable = scored.filter((x) => x.s > 0);
   const source = usable.length > 0 ? usable : scored;
 
   if (sessionId) {
-    // 세션 고정: 해시 → 계정. 단, 쿼터 소진(score 0)이면 다른 계정으로.
     const h = parseInt(createHash('sha1').update(sessionId).digest('hex').slice(0, 8), 16);
-    const pinned = source[h % source.length]!;
-    return pinned.e;
+    return source[h % source.length]!.e;
   }
-  // 무상태: 사용량 스코어 가중 랜덤 (없으면 라운드로빈)
   const total = source.reduce((a, x) => a + x.s, 0);
   if (total <= 0) return entries[rr++ % entries.length]!;
   let r = Math.random() * total;
@@ -96,7 +79,7 @@ function pick(pool: PoolName, sessionId: string): PoolEntry | null {
   return source[source.length - 1]!.e;
 }
 
-// ChatGPT Responses 페이로드 정규화
+// ChatGPT Responses 페이로드 정규화 (chatgpt 프로바이더 전용)
 function normalizeChatgptBody(body: Buffer): Buffer {
   if (!body || !body.length) return body;
   try {
@@ -125,30 +108,38 @@ function forward(
   opts: ForwardOpts,
   onFail: (() => void) | null,
 ): void {
+  const { provider } = opts;
   if (process.env.DEBUG_PROXY) {
     console.log(
-      `${new Date().toISOString()} [${opts.pool}:${chosen.acct}] FWD ${req.method} ${opts.path} body=${body.toString('utf8').slice(0, 200)}`,
+      `${new Date().toISOString()} [${provider.id}:${chosen.acct}] FWD ${req.method} ${opts.path} body=${body.toString('utf8').slice(0, 200)}`,
     );
   }
   const headers: Record<string, string | string[] | undefined> = { ...req.headers };
   delete headers.authorization;
   delete headers['x-api-key'];
   delete headers['content-length'];
-  if (opts.pool === 'chatgpt') {
+  if (provider.auth_header.toLowerCase() === 'authorization') {
     headers.authorization = `Bearer ${chosen.token}`;
-    if (chosen.accountId) headers['chatgpt-account-id'] = chosen.accountId;
-    if (chosen.installId) headers['x-codex-installation-id'] = chosen.installId;
+    if (provider.account_id_header && chosen.accountId) headers[provider.account_id_header] = chosen.accountId;
+    if (provider.id === 'chatgpt' && chosen.installId) headers['x-codex-installation-id'] = chosen.installId;
   } else {
-    headers['x-api-key'] = chosen.key!;
+    headers[provider.auth_header] = chosen.token;
   }
-  headers.host = opts.upstream.hostname;
+  headers.host = provider.base_url.replace(/^https?:\/\//, '').split('/')[0];
 
-  const upstreamPath = opts.path.startsWith(opts.upstream.base)
+  const upstreamPath = opts.path.startsWith(provider.path_prefix)
     ? opts.path
-    : `${opts.upstream.base}${opts.path}`;
+    : `${provider.path_prefix}${opts.path}`;
 
+  const url = new URL(provider.base_url);
   const r = https.request(
-    { ...opts.upstream, method: req.method, path: upstreamPath, headers },
+    {
+      hostname: url.hostname,
+      port: url.port ? Number(url.port) : 443,
+      method: req.method,
+      path: upstreamPath,
+      headers,
+    },
     (up) => {
       const retriable = up.statusCode === 401 || up.statusCode === 429;
       if (retriable && onFail) {
@@ -156,14 +147,14 @@ function forward(
         return onFail();
       }
       const ts = new Date().toISOString();
-      const tag = retriable ? `[${opts.pool}:${chosen.acct}!!${up.statusCode}]` : `[${opts.pool}:${chosen.acct}]`;
+      const tag = retriable ? `[${provider.id}:${chosen.acct}!!${up.statusCode}]` : `[${provider.id}:${chosen.acct}]`;
       console.log(`${ts} ${tag} ${req.method} ${opts.path} -> ${up.statusCode}`);
       res.writeHead(up.statusCode!, up.headers);
       up.pipe(res);
     },
   );
   r.on('error', (e) => {
-    console.log(`${new Date().toISOString()} [${opts.pool}:${chosen.acct}] ERR ${e.message}`);
+    console.log(`${new Date().toISOString()} [${provider.id}:${chosen.acct}] ERR ${e.message}`);
     res.destroy(e);
   });
   r.write(body);
@@ -171,24 +162,27 @@ function forward(
 }
 
 function routeFor(path: string, body: Buffer): Route | null {
-  if (path.startsWith('/backend-api/codex')) return { pool: 'chatgpt', path };
-  if (path.startsWith('/provider/v1')) return { pool: 'commandcode', path };
+  // 명시 경로 → 프로바이더
+  for (const p of providers) {
+    if (path.startsWith(p.path_prefix)) return { providerId: p.id, path };
+  }
   if (path.startsWith('/v1/')) {
     const rest = path.slice('/v1'.length);
     let model = '';
     try {
       model = (JSON.parse(body.toString('utf8')) as { model?: string }).model ?? '';
     } catch {}
-    for (const rule of MODEL_ROUTES) {
-      if (rule.test.test(model)) {
-        if (rule.pool === 'chatgpt') {
-          if (rest === '/responses' || rest === '/models') {
-            return { pool: 'chatgpt', path: `/backend-api/codex${rest}` };
+        for (const p of providers) {
+      try {
+        if (new RegExp(p.model_pattern).test(model)) {
+          // chatgpt는 Responses/모델 카탈로그만 (chat/completions 미지원)
+          if (p.id === 'chatgpt' && rest !== '/responses' && rest !== '/models') {
+            return { providerId: p.id, path, unsupported: true };
           }
-          return { pool: 'chatgpt', path, unsupported: true };
+          // /v1/* 요청을 provider의 path_prefix로 매핑: /v1/responses → {prefix}/responses
+          return { providerId: p.id, path: `${p.path_prefix}${rest}` };
         }
-        return { pool: 'commandcode', path: `/provider/v1${rest}` };
-      }
+      } catch {}
     }
   }
   return null;
@@ -204,27 +198,27 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
       res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ detail: 'no route' }));
       return;
     }
+    const provider = providers.find((p) => p.id === route.providerId);
+    if (!provider) {
+      res.writeHead(503, { 'content-type': 'application/json' }).end(JSON.stringify({ detail: 'provider not found' }));
+      return;
+    }
     if (route.unsupported) {
       res
         .writeHead(400, { 'content-type': 'application/json' })
-        .end(JSON.stringify({ detail: 'chatgpt pool only supports /v1/responses and /v1/models' }));
+        .end(JSON.stringify({ detail: `${provider.id} only supports /v1/responses and /v1/models` }));
       return;
     }
     const sessionId = (req.headers['x-session-id'] as string | undefined) ?? '';
-
-    const opts: ForwardOpts =
-      route.pool === 'chatgpt'
-        ? { pool: 'chatgpt', upstream: CHATGPT_UPSTREAM, path: route.path }
-        : { pool: 'commandcode', upstream: CC_UPSTREAM, path: route.path };
-
-    const chosen = pick(route.pool, sessionId);
+    const opts: ForwardOpts = { provider, path: route.path };
+    const chosen = pick(provider.id, sessionId);
     if (!chosen) {
-      res.writeHead(503).end(`no ${route.pool} accounts in accounts.db`);
+      res.writeHead(503).end(`no ${provider.id} accounts in accounts.db`);
       return;
     }
-    if (route.pool === 'chatgpt') body = normalizeChatgptBody(body);
+    if (provider.id === 'chatgpt') body = normalizeChatgptBody(body);
     const next = () => {
-      const pool = route.pool === 'chatgpt' ? chatgpt : commandcode;
+      const pool = pools[provider.id] ?? [];
       const alt = pool.find((k) => k.acct !== chosen.acct) ?? chosen;
       forward(req, res, body, alt, opts, null);
     };
@@ -234,9 +228,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
 
 http.createServer(handle).listen(PORT, '127.0.0.1', () => {
   console.log(
-    `codex-proxy on http://127.0.0.1:${PORT} chatgpt=${chatgpt.map((k) => `${k.acct}:${mask(k.token)}`).join(', ')} ` +
-      `commandcode=${commandcode.map((k) => `${k.acct}:${mask(k.key ?? '')}`).join(', ')}`,
+    `codex-proxy on http://127.0.0.1:${PORT} providers=${providers.map((p) => `${p.id}(${(pools[p.id] ?? []).length})`).join(', ')}`,
   );
-  // 5초 핫리로드: DB에서 계정/토큰/사용량 재조회 (login/refresh/quota 반영)
   setInterval(loadFromDb, 5000);
 });

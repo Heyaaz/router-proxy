@@ -53,17 +53,29 @@ button.danger:hover{border-color:var(--red);color:var(--red)}
   </div>
 </header>
 <main id="board"></main>
-<section class="col" id="models-col">
-  <h2>모델 라우트<span class="count" id="models-count"></span></h2>
-  <div id="models-list"></div>
+<section class="col" id="providers-col">
+  <h2>서빙 업체<span class="count" id="providers-count"></span></h2>
+  <div id="providers-list"></div>
   <div class="row3" style="margin-top:10px">
-    <select id="m-pool" style="background:#0f1115;border:1px solid var(--line);border-radius:4px;color:var(--text);font-size:11px;padding:2px 4px">
-      <option value="chatgpt">chatgpt</option>
-      <option value="commandcode">commandcode</option>
-    </select>
-    <input type="text" id="m-pattern" placeholder="정규식" style="flex:1">
-    <input type="number" id="m-priority" value="100" style="width:48px" title="우선순위">
-    <button id="m-add">추가</button>
+    <input type="text" id="p-id" placeholder="id (opencode-go)" style="flex:1">
+    <input type="text" id="p-name" placeholder="이름" style="width:90px">
+    <button id="p-add">업체 추가</button>
+  </div>
+  <div class="row3" style="margin-top:6px">
+    <input type="text" id="p-base" placeholder="base URL https://..." style="flex:1">
+  </div>
+  <div class="row3" style="margin-top:6px">
+    <input type="text" id="p-prefix" placeholder="경로 /provider/v1" style="width:120px">
+    <input type="text" id="p-auth" placeholder="헤더 x-api-key" style="width:110px">
+    <input type="text" id="p-model" placeholder="모델 정규식 .*" style="flex:1">
+  </div>
+  <div class="row3" style="margin-top:6px">
+    <input type="text" id="p-accid" placeholder="account-id 헤더 (선택)" style="width:150px">
+    <button id="p-add-acc">이 업체에 계정 추가</button>
+  </div>
+  <div class="row3" style="margin-top:6px">
+    <input type="text" id="p-slot" placeholder="슬롯 (a)" style="width:60px">
+    <input type="text" id="p-token" placeholder="토큰/키" style="flex:1">
   </div>
 </section>
 <div class="err" id="err"></div>
@@ -129,33 +141,34 @@ function card(a){
   </div>`;
 }
 
+let providers = [];
 function render(){
-  const cols = {
-    chatgpt: { title: 'ChatGPT 풀', items: [] },
-    commandcode: { title: 'Command Code 풀', items: [] },
-    paused: { title: '일시정지', items: [] },
-  };
+  // 업체별 컬럼 + 일시정지 컬럼
+  const cols = {};
+  for (const p of providers) cols[p.id] = { title: p.name || p.id, items: [] };
+  cols._paused = { title: '일시정지', items: [] };
   for (const a of accounts){
-    cols[a.status === 'active' ? a.pool : 'paused'].items.push(a);
+    const key = a.status === 'active' ? a.pool : '_paused';
+    (cols[key] ?? cols._paused).items.push(a);
   }
-  for (const c of Object.values(cols)){
-    c.items.sort((x,y) => remaining(x) - remaining(y));
-  }
+  for (const c of Object.values(cols)) c.items.sort((x,y) => remaining(x) - remaining(y));
   board.innerHTML = Object.values(cols).map(c => `
     <section class="col">
       <h2>${c.title}<span class="count">${c.items.length}</span></h2>
       ${c.items.map(card).join('') || '<div class="empty">없음</div>'}
     </section>`).join('');
   const active = accounts.filter(a => a.status === 'active').length;
-  meta.textContent = `${accounts.length}개 계정 (활성 ${active}) · ${new Date().toLocaleTimeString('ko-KR')}`;
+  meta.textContent = `${accounts.length}개 계정 (활성 ${active}) · ${providers.length}개 업체 · ${new Date().toLocaleTimeString('ko-KR')}`;
 }
 
 async function load(){
   try {
     const res = await api('/api/accounts');
     accounts = res.accounts ?? [];
+    providers = res.providers ?? [];
     err.textContent = '';
     render();
+    renderProviders();
   } catch(e){
     err.textContent = '로드 실패: ' + e.message;
   }
@@ -199,54 +212,60 @@ board.addEventListener('change', async (ev) => {
   } catch(e){ err.textContent = '실패: ' + e.message; }
 });
 
-// 모델 라우트
-let routes = [];
-async function loadModels(){
-  try {
-    const res = await api('/api/models');
-    routes = res.routes ?? [];
-    $('#models-count').textContent = routes.length;
-    $('#models-list').innerHTML = routes.map(r => `
-      <div class="card" style="margin-bottom:6px">
-        <div class="row1">
-          <span class="slot" style="font-size:11px">#${r.id}</span>
-          <span class="label" style="font-size:11px">[${r.pool}] ${r.pattern}</span>
-        </div>
-        <div class="row2">
-          <span>priority ${r.priority}</span>
-          <span>${r.enabled ? 'on' : 'off'}</span>
-        </div>
-        <div class="row3">
-          <button data-mact="del" data-id="${r.id}">삭제</button>
-        </div>
-      </div>`).join('') || '<div class="empty">라우트 없음</div>';
-  } catch(e){ $('#models-list').innerHTML = '<div class="empty">로드 실패</div>'; }
+// 서빙 업체 관리
+let selectedProvider = '';
+function renderProviders(){
+  $('#providers-count').textContent = providers.length;
+  $('#providers-list').innerHTML = providers.map(p => `
+    <div class="card" style="margin-bottom:6px;cursor:pointer" data-provider="${p.id}">
+      <div class="row1">
+        <span class="slot" style="font-size:12px">${p.name || p.id}</span>
+        <span class="label" style="font-size:11px">${p.id} · ${p.modelPattern || '.*'}</span>
+      </div>
+      <div class="row2">
+        <span>${p.base_url}${p.path_prefix}</span>
+      </div>
+    </div>`).join('') || '<div class="empty">업체 없음</div>';
 }
-$('#m-add').addEventListener('click', async () => {
-  const pool = $('#m-pool').value, pattern = $('#m-pattern').value.trim(), priority = Number($('#m-priority').value || 100);
-  if (!pattern) return;
-  try {
-    await api('/api/models', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({pool, pattern, priority}) });
-    $('#m-pattern').value = '';
-    loadModels();
-  } catch(e){ err.textContent = '추가 실패: ' + e.message; }
+$('#providers-list').addEventListener('click', (ev) => {
+  const card = ev.target.closest('[data-provider]');
+  if (!card) return;
+  selectedProvider = card.dataset.provider;
+  document.querySelectorAll('[data-provider]').forEach(c => c.style.outline = '');
+  card.style.outline = '1px solid var(--blue)';
 });
-$('#models-list').addEventListener('click', async (ev) => {
-  const btn = ev.target.closest('button[data-mact]');
-  if (!btn) return;
+$('#p-add').addEventListener('click', async () => {
+  const id = $('#p-id').value.trim(), name = $('#p-name').value.trim();
+  if (!id || !name) { err.textContent = '업체 id와 이름 필요'; return; }
   try {
-    if (btn.dataset.mact === 'del') {
-      if (!confirm('라우트 삭제?')) return;
-      await api(`/api/models/${btn.dataset.id}`, { method:'DELETE' });
-      loadModels();
-    }
-  } catch(e){ err.textContent = '삭제 실패: ' + e.message; }
+    await api('/api/providers', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+      id, name,
+      baseUrl: $('#p-base').value.trim() || 'https://example.com',
+      pathPrefix: $('#p-prefix').value.trim() || '/provider/v1',
+      authHeader: $('#p-auth').value.trim() || 'x-api-key',
+      modelPattern: $('#p-model').value.trim() || '.*',
+      accountIdHeader: $('#p-accid').value.trim() || null,
+    }) });
+    $('#p-id').value = ''; $('#p-name').value = '';
+    load();
+  } catch(e){ err.textContent = '업체 추가 실패: ' + e.message; }
+});
+$('#p-add-acc').addEventListener('click', async () => {
+  if (!selectedProvider) { err.textContent = '먼저 업체를 선택하세요'; return; }
+  const slot = $('#p-slot').value.trim(), token = $('#p-token').value.trim();
+  if (!slot || !token) { err.textContent = '슬롯과 토큰/키 필요'; return; }
+  try {
+    await api('/api/accounts', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+      providerId: selectedProvider, slot, token,
+    }) });
+    $('#p-slot').value = ''; $('#p-token').value = '';
+    load();
+  } catch(e){ err.textContent = '계정 추가 실패: ' + e.message; }
 });
 
-$('#refresh').addEventListener('click', () => { load(); loadModels(); });
-setInterval(() => { if ($('#auto').checked) { load(); loadModels(); } }, 30000);
+$('#refresh').addEventListener('click', load);
+setInterval(() => { if ($('#auto').checked) load(); }, 30000);
 load();
-loadModels();
 </script>
 </body>
 </html>

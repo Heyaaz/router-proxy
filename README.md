@@ -110,9 +110,11 @@ CLI helpers: `node ~/.codex-accounts/db.ts list|usage`
 /v1/*                 → model-based routing: gpt-5.x/o*/codex- → ChatGPT pool, everything else → Command Code
 ```
 
-The routing table lives in the `model_routes` table (managed via dashboard or
-`node ~/.codex-accounts/db.ts routes|route-add|route-del`). The proxy reloads
-it every 5s. Lower `priority` matches first; `.*` is the catch-all fallback.
+Routing is provider-driven: `/v1/*` requests match the model name against each
+provider's `model_pattern` regex (in provider order); explicit paths
+(`/backend-api/codex/*`, `/provider/v1/*`) map to the provider whose
+`path_prefix` matches. Providers are managed via the dashboard or
+`node ~/.codex-accounts/db.ts providers|provider-add|provider-del`.
 
 ## Control API + dashboard (:9092)
 
@@ -121,13 +123,17 @@ compact kanban-style web dashboard (no framework, single HTML file served at
 `/`). Also serves a QuotaBar-compatible `/api/accounts` endpoint (point
 QuotaBar at `CODEXBAR_ENDPOINT=http://127.0.0.1:9092`).
 
-Open http://127.0.0.1:9092/ in a browser. Columns: ChatGPT pool / Command Code
-pool / paused. Each card shows remaining %, reset countdown, plan, weight, and
-inline controls (pause, burn, weight, label, delete). Auto-refreshes every 30s.
-A **model routes** panel manages the `/v1/*` routing table (add/delete regex
-patterns per pool). **Burn** (🔥) bumps an account's burn priority ×1..×3 —
-burned accounts are drained first regardless of usage score; clicking at ×3
-resets to 0.
+Open http://127.0.0.1:9092/ in a browser. Columns: one per **provider**
+(serving vendor: GPT (ChatGPT), Command Code, or custom ones like OpenCode Go)
+plus a paused column. Each card shows remaining %, reset countdown, plan,
+weight, and inline controls (pause, burn, weight, label, delete).
+Auto-refreshes every 30s.
+
+A **서빙 업체 (providers)** panel adds new vendors (id, name, base URL, path
+prefix, auth header, model regex) and adds accounts to a selected provider.
+Providers are stored in the `providers` table; the proxy reloads every 5s.
+**Burn** (🔥) bumps an account's burn priority ×1..×3 — burned accounts are
+drained first regardless of usage score; clicking at ×3 resets to 0.
 
 ```
 GET    /api/accounts                            → account list (QuotaBar schema)
@@ -138,14 +144,16 @@ POST   /api/accounts/:pool/:slot/weight         → {"weight":1.5} routing weigh
 POST   /api/accounts/:pool/:slot/label          → {"label":"work"} rename
 POST   /api/accounts/:pool/:slot/burn           → {"burn":1} burn priority (0-3)
 DELETE /api/accounts/:pool/:slot                → delete account
-GET    /api/models                              → model route list
-POST   /api/models                              → {"pool","pattern","priority"} add route
-DELETE /api/models/:id                          → delete route
+GET    /api/providers                           → provider list
+POST   /api/providers                           → add provider {id,name,baseUrl,pathPrefix,authHeader,modelPattern}
+DELETE /api/providers/:id                       → delete provider
+POST   /api/accounts                            → add account {providerId,slot,token,...}
 ```
 
-`pool` is `chatgpt` or `commandcode`; `slot` is the account id (`a`, `b`, `c`, …).
-Disabled accounts are excluded from routing; weight multiplies the usage score;
-burn priority (0–3) drains the account first regardless of score.
+`pool`/`providerId` is any provider id (`chatgpt`, `commandcode`, custom…);
+`slot` is the account id (`a`, `b`, `c`, …). Disabled accounts are excluded
+from routing; weight multiplies the usage score; burn priority (0–3) drains
+the account first regardless of score.
 
 `pool` is `chatgpt` or `commandcode`; `slot` is the account id (`a`, `b`, `c`, …).
 Disabled accounts are excluded from routing; weight multiplies the usage score.

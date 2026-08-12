@@ -14,6 +14,17 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 export type Pool = 'chatgpt' | 'commandcode';
+export type Provider = {
+  id: string;           // 'chatgpt' | 'commandcode' | 'opencode-go' ...
+  name: string;         // 표시 이름 'Command Code'
+  base_url: string;     // 'https://api.commandcode.ai'
+  path_prefix: string;  // '/provider/v1' | '/backend-api/codex'
+  auth_header: string;  // 'x-api-key' | 'authorization'
+  account_id_header: string | null;  // 'chatgpt-account-id' 등 (선택)
+  model_pattern: string; // 이 업체가 받는 모델 정규식
+  enabled: number;
+  created_at: number;
+};
 export type AccountRow = {
   id: number;
   pool: Pool;
@@ -115,7 +126,7 @@ export function initDb(): DatabaseSync {
   db.exec(`
     CREATE TABLE IF NOT EXISTS accounts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      pool TEXT NOT NULL CHECK (pool IN ('chatgpt','commandcode')),
+      pool TEXT NOT NULL,  -- provider id (chatgpt, commandcode, ...)
       slot TEXT NOT NULL,
       label TEXT,
       access_token_enc TEXT,
@@ -140,29 +151,59 @@ export function initDb(): DatabaseSync {
       window_seconds INTEGER,
       fetched_at INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS model_routes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      pool TEXT NOT NULL CHECK (pool IN ('chatgpt','commandcode')),
-      pattern TEXT NOT NULL,
-      priority INTEGER NOT NULL DEFAULT 100,
+    CREATE TABLE IF NOT EXISTS providers (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      base_url TEXT NOT NULL,
+      path_prefix TEXT NOT NULL,
+      auth_header TEXT NOT NULL DEFAULT 'x-api-key',
+      account_id_header TEXT,
+      model_pattern TEXT NOT NULL DEFAULT '.*',
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_usage_latest
       ON usage_snapshots(pool, slot, window, fetched_at DESC);
   `);
+  // 기존 DB 마이그레이션: accounts 테이블에 CHECK(pool IN (...)) 제약이 있으면 재생성 (provider 일반화)
+  const oldSql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'").get() as { sql: string } | undefined)?.sql ?? '';
+  if (oldSql.includes('CHECK (pool')) {
+    db.exec(`
+      ALTER TABLE accounts RENAME TO accounts_old;
+      CREATE TABLE accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pool TEXT NOT NULL,
+        slot TEXT NOT NULL,
+        label TEXT,
+        access_token_enc TEXT,
+        refresh_token_enc TEXT,
+        account_id TEXT,
+        email TEXT,
+        install_id TEXT,
+        plan_type TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        weight REAL NOT NULL DEFAULT 1.0,
+        burn_priority INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(pool, slot)
+      );
+      INSERT INTO accounts (id, pool, slot, label, access_token_enc, refresh_token_enc, account_id, email, install_id, plan_type, enabled, weight, burn_priority, created_at, updated_at)
+        SELECT id, pool, slot, label, access_token_enc, refresh_token_enc, account_id, email, install_id, plan_type, enabled, weight, burn_priority, created_at, updated_at FROM accounts_old;
+      DROP TABLE accounts_old;
+    `);
+    console.log('[db] accounts 테이블 재생성 (CHECK 제약 제거)');
+  }
   // 기존 DB 마이그레이션: enabled/weight/burn_priority 컬럼 추가
   const cols = db.prepare(`PRAGMA table_info(accounts)`).all() as { name: string }[];
   if (!cols.some((c) => c.name === 'enabled')) db.exec(`ALTER TABLE accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`);
   if (!cols.some((c) => c.name === 'weight')) db.exec(`ALTER TABLE accounts ADD COLUMN weight REAL NOT NULL DEFAULT 1.0`);
   if (!cols.some((c) => c.name === 'burn_priority')) db.exec(`ALTER TABLE accounts ADD COLUMN burn_priority INTEGER NOT NULL DEFAULT 0`);
-  // 기본 모델 라우트 시드 (누락분만 추가 — 항상 catch-all 보장)
+  // 기본 프로바이더 시드 (누락분만 추가)
   const now = Math.floor(Date.now() / 1000);
-  const seed = db.prepare('INSERT INTO model_routes (pool, pattern, priority, enabled, created_at) VALUES (?,?,?,?,?)');
-  const chatgptRoute = (db.prepare("SELECT COUNT(*) c FROM model_routes WHERE pool='chatgpt'").get() as { c: number }).c;
-  if (chatgptRoute === 0) seed.run('chatgpt', '^(gpt-5\\.|gpt-4\\.|o[0-9]|codex-)', 10, 1, now);
-  const ccCatchAll = (db.prepare("SELECT COUNT(*) c FROM model_routes WHERE pool='commandcode' AND pattern='.*'").get() as { c: number }).c;
-  if (ccCatchAll === 0) seed.run('commandcode', '.*', 999, 1, now);
+  const seed = db.prepare('INSERT OR IGNORE INTO providers (id, name, base_url, path_prefix, auth_header, account_id_header, model_pattern, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?)');
+  seed.run('chatgpt', 'GPT (ChatGPT)', 'https://chatgpt.com', '/backend-api/codex', 'authorization', 'chatgpt-account-id', '^(gpt-5\\.|gpt-4\\.|o[0-9]|codex-)', 1, now);
+  seed.run('commandcode', 'Command Code', 'https://api.commandcode.ai', '/provider/v1', 'x-api-key', null, '.*', 1, now);
   _db = db;
   _key = getOrCreateKey();
   return db;
@@ -260,6 +301,49 @@ export function setAccountBurn(pool: Pool, slot: string, burn: number): void {
   const db = initDb();
   db.prepare('UPDATE accounts SET burn_priority=?, updated_at=? WHERE pool=? AND slot=?')
     .run(burn, Math.floor(Date.now() / 1000), pool, slot);
+}
+
+// ---------- providers ----------
+export function listProviders(): Provider[] {
+  const db = initDb();
+  const rows = db.prepare('SELECT * FROM providers ORDER BY created_at, id').all();
+  return (rows as any[]).map((r) => ({
+    id: r.id as string, name: r.name as string, base_url: r.base_url as string,
+    path_prefix: r.path_prefix as string, auth_header: r.auth_header as string,
+    account_id_header: r.account_id_header ?? null, model_pattern: r.model_pattern as string,
+    enabled: r.enabled as number, created_at: r.created_at as number,
+  }));
+}
+
+export function upsertProvider(p: {
+  id: string;
+  name: string;
+  baseUrl: string;
+  pathPrefix: string;
+  authHeader?: string;
+  accountIdHeader?: string | null;
+  modelPattern?: string;
+  enabled?: number;
+}): void {
+  const db = initDb();
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(`
+    INSERT INTO providers (id, name, base_url, path_prefix, auth_header, account_id_header, model_pattern, enabled, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(id) DO UPDATE SET
+      name=excluded.name, base_url=excluded.base_url, path_prefix=excluded.path_prefix,
+      auth_header=excluded.auth_header, account_id_header=excluded.account_id_header,
+      model_pattern=excluded.model_pattern, enabled=excluded.enabled
+  `).run(p.id, p.name, p.baseUrl, p.pathPrefix, p.authHeader ?? 'x-api-key', p.accountIdHeader ?? null, p.modelPattern ?? '.*', p.enabled ?? 1, now);
+}
+
+export function deleteProvider(id: string): void {
+  const db = initDb();
+  db.prepare('DELETE FROM providers WHERE id=?').run(id);
+}
+
+export function getProvider(id: string): Provider | null {
+  return listProviders().find((p) => p.id === id) ?? null;
 }
 
 // ---------- model_routes ----------
@@ -386,15 +470,15 @@ if (args.length > 0 && args[0] !== '--help') {
   } else if (args[0] === 'burn' && args[1] && args[2] && args[3]) {
     setAccountBurn(args[1] as Pool, args[2], Number(args[3]));
     console.log(`${args[1]}/${args[2]} 우선순위 ${args[3]}`);
-  } else if (args[0] === 'routes') {
-    for (const r of listModelRoutes()) {
-      console.log(`#${r.id} [${r.pool}] ${r.pattern} (priority=${r.priority}, ${r.enabled ? 'on' : 'off'})`);
+  } else if (args[0] === 'providers') {
+    for (const p of listProviders()) {
+      console.log(`[${p.id}] ${p.name} → ${p.base_url}${p.path_prefix} (auth=${p.auth_header}, model=${p.model_pattern}, ${p.enabled ? 'on' : 'off'})`);
     }
-  } else if (args[0] === 'route-add' && args[1] && args[2]) {
-    upsertModelRoute({ pool: args[1] as Pool, pattern: args[2], priority: Number(args[3] ?? 100) });
-    console.log(`라우트 추가: ${args[1]} ${args[2]}`);
-  } else if (args[0] === 'route-del' && args[1]) {
-    deleteModelRoute(Number(args[1]));
-    console.log(`라우트 #${args[1]} 삭제`);
+  } else if (args[0] === 'provider-add' && args[1] && args[2] && args[3]) {
+    upsertProvider({ id: args[1], name: args[2], baseUrl: args[3], pathPrefix: args[4] ?? '/provider/v1', authHeader: args[5] ?? 'x-api-key' });
+    console.log(`프로바이더 추가: ${args[1]} (${args[2]})`);
+  } else if (args[0] === 'provider-del' && args[1]) {
+    deleteProvider(args[1]);
+    console.log(`프로바이더 삭제: ${args[1]}`);
   }
 }

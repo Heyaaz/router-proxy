@@ -15,7 +15,7 @@ import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { initDb, listAccounts, latestUsage, setAccountEnabled, setAccountWeight, updateAccountLabel, deleteAccount, setAccountBurn, listModelRoutes, upsertModelRoute, deleteModelRoute } from './db.ts';
+import { initDb, listAccounts, latestUsage, setAccountEnabled, setAccountWeight, updateAccountLabel, deleteAccount, setAccountBurn, listProviders, upsertProvider, deleteProvider, upsertAccount } from './db.ts';
 import type { Pool } from './db.ts';
 
 const PORT = Number(process.env.CONTROL_PORT ?? 9092);
@@ -44,16 +44,20 @@ function readBody(req: http.IncomingMessage): Promise<Record<string, any>> {
 function accountsResponse(): unknown {
   const usage = latestUsage();
   const now = Date.now() / 1000;
+  const providers = listProviders();
   return {
+    providers: providers.map((p) => ({ id: p.id, name: p.name, modelPattern: p.model_pattern })),
     accounts: listAccounts().map((a) => {
       const u = usage[`${a.pool}:${a.slot}`];
       const win = a.pool === 'chatgpt' ? 'primary' : u?.weekly ? 'weekly' : 'fiveHour';
       const w = u?.[win as string];
       const remaining = w ? Math.max(0, 100 - w.used_percent) : null;
       const shortName = (a.label ?? a.email ?? a.slot).split('@')[0].slice(0, 14);
+      const prov = providers.find((p) => p.id === a.pool);
       return {
         accountId: a.slot,
         pool: a.pool,
+        providerName: prov?.name ?? a.pool,
         email: a.email,
         alias: a.label,
         displayName: shortName,
@@ -76,8 +80,8 @@ http
   .createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`);
     const path = url.pathname;
-    const m = path.match(/^\/api\/accounts\/(chatgpt|commandcode)\/([a-z0-9_-]+)\/(enabled|weight|label)$/);
-    const del = path.match(/^\/api\/accounts\/(chatgpt|commandcode)\/([a-z0-9_-]+)$/);
+    const m = path.match(/^\/api\/accounts\/([a-z0-9_-]+)\/([a-z0-9_-]+)\/(enabled|weight|label)$/);
+    const del = path.match(/^\/api\/accounts\/([a-z0-9_-]+)\/([a-z0-9_-]+)$/);
 
     try {
       if (req.method === 'GET' && (path === '/' || path === '/index.html')) {
@@ -98,25 +102,41 @@ http
           usageSnapshots: Object.keys(latestUsage()).length,
           ts: Date.now(),
         });
-      } else if (req.method === 'GET' && path === '/api/models') {
-        json(res, 200, { routes: listModelRoutes() });
-      } else if (req.method === 'POST' && path === '/api/models') {
+      } else if (req.method === 'GET' && path === '/api/providers') {
+        json(res, 200, { providers: listProviders() });
+      } else if (req.method === 'POST' && path === '/api/providers') {
         const body = await readBody(req);
-        if (!body.pool || !body.pattern) return json(res, 400, { error: 'pool and pattern required' });
-        try { new RegExp(body.pattern); } catch { return json(res, 400, { error: 'invalid regex' }); }
-        upsertModelRoute({
-          id: body.id ? Number(body.id) : undefined,
-          pool: body.pool as Pool,
-          pattern: String(body.pattern),
-          priority: body.priority !== undefined ? Number(body.priority) : 100,
+        if (!body.id || !body.name || !body.baseUrl) return json(res, 400, { error: 'id, name, baseUrl required' });
+        try { new RegExp(body.modelPattern ?? '.*'); } catch { return json(res, 400, { error: 'invalid modelPattern regex' }); }
+        upsertProvider({
+          id: String(body.id),
+          name: String(body.name),
+          baseUrl: String(body.baseUrl),
+          pathPrefix: String(body.pathPrefix ?? '/provider/v1'),
+          authHeader: String(body.authHeader ?? 'x-api-key'),
+          accountIdHeader: body.accountIdHeader ? String(body.accountIdHeader) : null,
+          modelPattern: String(body.modelPattern ?? '.*'),
           enabled: body.enabled !== undefined ? (body.enabled ? 1 : 0) : 1,
         });
         json(res, 200, { ok: true });
-      } else if (req.method === 'DELETE' && path.match(/^\/api\/models\/\d+$/)) {
-        deleteModelRoute(Number(path.split('/').pop()));
+      } else if (req.method === 'DELETE' && path.match(/^\/api\/providers\/[a-z0-9_-]+$/)) {
+        deleteProvider(String(path.split('/').pop()));
         json(res, 200, { ok: true });
-      } else if (req.method === 'POST' && path.match(/^\/api\/accounts\/(chatgpt|commandcode)\/[a-z0-9_-]+\/burn$/)) {
-        const [, pool, slot] = path.match(/^\/api\/accounts\/(chatgpt|commandcode)\/([a-z0-9_-]+)\/burn$/)!;
+      } else if (req.method === 'POST' && path === '/api/accounts') {
+        // 업체에 계정 추가: {providerId, slot, token, refresh?, accountId?, email?}
+        const body = await readBody(req);
+        if (!body.providerId || !body.slot || !body.token) return json(res, 400, { error: 'providerId, slot, token required' });
+        upsertAccount({
+          pool: body.providerId as Pool,
+          slot: String(body.slot),
+          accessToken: String(body.token),
+          refreshToken: body.refresh ? String(body.refresh) : null,
+          accountId: body.accountId ? String(body.accountId) : null,
+          email: body.email ? String(body.email) : null,
+        });
+        json(res, 200, { ok: true });
+      } else if (req.method === 'POST' && path.match(/^\/api\/accounts\/[a-z0-9_-]+\/[a-z0-9_-]+\/burn$/)) {
+        const [, pool, slot] = path.match(/^\/api\/accounts\/([a-z0-9_-]+)\/([a-z0-9_-]+)\/burn$/)!;
         const body = await readBody(req);
         const burn = Number(body.burn ?? 0);
         if (!Number.isFinite(burn) || burn < 0) return json(res, 400, { error: 'burn must be >= 0' });
