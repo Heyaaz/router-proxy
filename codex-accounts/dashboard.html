@@ -143,7 +143,7 @@ function card(a){
       ${paused
         ? '<button data-act="enable">재개</button>'
         : '<button data-act="disable">일시정지</button>'}
-      <input type="number" step="0.1" min="0.1" value="${a.weight ?? 1}" title="가중치" data-act="weight">
+      <span style="color:var(--dim);font-size:11px">×</span><input type="number" step="0.1" min="0.1" value="${a.weight ?? 1}" title="가중치 (라우팅 점수 배수)" data-act="weight" style="width:44px">
       <button data-act="burn" title="우선 태우기 (클릭할 때마다 +1, 0이면 해제)">🔥 태우기 ${(a.burnPriority ?? 0) ? '×' + a.burnPriority : ''}</button>
       <input type="text" value="${a.alias || ''}" placeholder="라벨" title="라벨" data-act="label">
       <button class="danger" data-act="del">삭제</button>
