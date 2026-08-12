@@ -113,11 +113,16 @@ CLI helpers: `node ~/.codex-accounts/db.ts list|usage`
 Edit the `MODEL_ROUTES` table at the top of `codex-accounts/proxy.ts` to change
 the model routing.
 
-## Control API (:9092)
+## Control API + dashboard (:9092)
 
-Lightweight HTTP API for account management and routing control — no web UI.
-Also serves a QuotaBar-compatible `/api/accounts` endpoint (point QuotaBar at
-`CODEXBAR_ENDPOINT=http://127.0.0.1:9092`).
+Lightweight HTTP API for account management and routing control, plus a
+compact kanban-style web dashboard (no framework, single HTML file served at
+`/`). Also serves a QuotaBar-compatible `/api/accounts` endpoint (point
+QuotaBar at `CODEXBAR_ENDPOINT=http://127.0.0.1:9092`).
+
+Open http://127.0.0.1:9092/ in a browser. Columns: ChatGPT pool / Command Code
+pool / paused. Each card shows remaining %, reset countdown, plan, weight, and
+inline controls (pause, weight, label, delete). Auto-refreshes every 30s.
 
 ```
 GET    /api/accounts                            → account list (QuotaBar schema)
@@ -142,6 +147,7 @@ CLI equivalents: `node ~/.codex-accounts/db.ts enable|disable|weight|label|del`.
 | `CODEX_ACCOUNTS_DB` | `$CODEX_ACCOUNTS_DIR/accounts.db` | Override DB path |
 | `CODEX_ACCOUNTS_KEY` | `$CODEX_ACCOUNTS_DIR/encryption.key` | Override key path |
 | `CONTROL_PORT` | `9092` | Control API port |
+| `CODEX_DASHBOARD` | `~/.codex-accounts/dashboard.html` | Dashboard HTML path |
 
 ## Notes
 

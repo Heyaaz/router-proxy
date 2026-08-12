@@ -79,7 +79,7 @@ fi
 
 if [ "$INSTALL_CODEX" = true ]; then
   ensure_dirs "$HOME_DIR/.codex-accounts"
-  run cp "$SCRIPT_DIR/codex-accounts/proxy.ts" "$SCRIPT_DIR/codex-accounts/login.ts" "$SCRIPT_DIR/codex-accounts/export-tokens.ts" "$SCRIPT_DIR/codex-accounts/db.ts" "$SCRIPT_DIR/codex-accounts/quota.ts" "$SCRIPT_DIR/codex-accounts/control.ts" "$HOME_DIR/.codex-accounts/"
+  run cp "$SCRIPT_DIR/codex-accounts/proxy.ts" "$SCRIPT_DIR/codex-accounts/login.ts" "$SCRIPT_DIR/codex-accounts/export-tokens.ts" "$SCRIPT_DIR/codex-accounts/db.ts" "$SCRIPT_DIR/codex-accounts/quota.ts" "$SCRIPT_DIR/codex-accounts/control.ts" "$SCRIPT_DIR/codex-accounts/dashboard.html" "$HOME_DIR/.codex-accounts/"
   say "통합 프록시 + quota + control 설치: ~/.codex-accounts/ (:9091, :9092)"
 fi
 

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>router-proxy · control</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+  --text:#e6e9ef; --dim:#8b93a3; --green:#3fb950; --yellow:#d29922; --red:#f85149;
+  --blue:#58a6ff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;padding:16px}
+header{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+header h1{font-size:15px;font-weight:600}
+header h1 span{color:var(--blue)}
+header .meta{color:var(--dim);font-size:12px}
+header .actions{margin-left:auto;display:flex;gap:8px;align-items:center}
+button{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+button:hover{border-color:var(--blue)}
+button.danger:hover{border-color:var(--red);color:var(--red)}
+#board{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:14px;align-items:start}
+.col{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;min-height:180px}
+.col h2{font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px;display:flex;justify-content:space-between}
+.col h2 .count{background:var(--panel2);border-radius:10px;padding:0 7px;font-size:11px}
+.card{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin-bottom:8px}
+.card .row1{display:flex;align-items:center;gap:6px;margin-bottom:4px}
+.card .slot{font-weight:700;font-size:13px}
+.card .label{color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.card .plan{font-size:10px;background:#00000040;border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--dim);white-space:nowrap}
+.badge{font-size:10px;border-radius:4px;padding:1px 6px;font-weight:600;white-space:nowrap}
+.badge.paused{background:#ffffff14;color:var(--dim)}
+.badge.drained{background:var(--red);color:#fff}
+.badge.low{background:var(--yellow);color:#111}
+.bar{height:5px;background:#00000050;border-radius:3px;overflow:hidden;margin:6px 0 4px}
+.bar i{display:block;height:100%;border-radius:3px}
+.card .row2{display:flex;justify-content:space-between;color:var(--dim);font-size:11px;margin-top:2px}
+.card .row3{display:flex;gap:6px;margin-top:8px;align-items:center;flex-wrap:wrap}
+.card input[type=number]{width:54px;background:#0f1115;border:1px solid var(--line);border-radius:4px;color:var(--text);padding:2px 4px;font-size:11px}
+.card input[type=text]{background:#0f1115;border:1px solid var(--line);border-radius:4px;color:var(--text);padding:2px 6px;font-size:11px;width:90px}
+.err{color:var(--red);font-size:12px;margin-top:8px}
+.empty{color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>router-proxy <span>·</span> control</h1>
+  <span class="meta" id="meta">불러오는 중…</span>
+  <div class="actions">
+    <button id="refresh">새로고침</button>
+    <label style="color:var(--dim);font-size:12px;display:flex;gap:4px;align-items:center"><input type="checkbox" id="auto" checked> 자동</label>
+  </div>
+</header>
+<main id="board"></main>
+<div class="err" id="err"></div>
+<script>
+const $ = (s) => document.querySelector(s);
+const board = $('#board'), meta = $('#meta'), err = $('#err');
+let accounts = [];
+
+function pct(v){ return Math.max(0, Math.min(100, Math.round(v||0))); }
+function barColor(p){ return p >= 50 ? 'var(--green)' : p >= 20 ? 'var(--yellow)' : 'var(--red)'; }
+function fmtReset(ts){
+  if (!ts) return '리셋 정보 없음';
+  const diff = ts*1000 - Date.now();
+  if (diff <= 0) return '리셋됨';
+  const d = Math.floor(diff/86400000), h = Math.floor(diff%86400000/3600000);
+  return d > 0 ? `D-${d} ${h}시간` : h > 0 ? `${h}시간 후` : `${Math.max(1,Math.floor(diff/60000))}분 후`;
+}
+function shortName(a){ return (a.label || a.email || a.slot).split('@')[0].slice(0,14); }
+function remaining(a){
+  const u = a.usage || {};
+  return u.primaryRemainingPercent ?? u.secondaryRemainingPercent ?? 100;
+}
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function card(a){
+  const rem = remaining(a);
+  const low = rem < 20;
+  const drained = rem <= 0;
+  const paused = a.status !== 'active';
+  const win = a.windowMinutesSecondary ? (a.windowMinutesSecondary/1440).toFixed(1) : null;
+  return `
+  <div class="card" data-key="${a.pool}/${a.accountId}">
+    <div class="row1">
+      <span class="slot">${a.accountId}</span>
+      <span class="label" title="${a.email || ''}">${shortName(a)}</span>
+      ${a.planType ? `<span class="plan">${a.planType}</span>` : ''}
+      ${paused ? '<span class="badge paused">일시정지</span>' : drained ? '<span class="badge drained">소진</span>' : low ? '<span class="badge low">주의</span>' : ''}
+    </div>
+    <div class="bar"><i style="width:${pct(rem)}%;background:${barColor(rem)}"></i></div>
+    <div class="row2">
+      <span>남음 ${pct(rem)}%</span>
+      <span>${fmtReset(a.resetAtSecondary)}</span>
+    </div>
+    <div class="row2">
+      <span>${win ? `윈도우 ${win}일` : '—'}</span>
+      <span>weight ×${a.weight ?? 1}</span>
+    </div>
+    <div class="row3">
+      ${paused
+        ? '<button data-act="enable">재개</button>'
+        : '<button data-act="disable">일시정지</button>'}
+      <input type="number" step="0.1" min="0.1" value="${a.weight ?? 1}" title="가중치" data-act="weight">
+      <input type="text" value="${a.label || ''}" placeholder="라벨" title="라벨" data-act="label">
+      <button class="danger" data-act="del">삭제</button>
+    </div>
+  </div>`;
+}
+
+function render(){
+  const cols = {
+    chatgpt: { title: 'ChatGPT 풀', items: [] },
+    commandcode: { title: 'Command Code 풀', items: [] },
+    paused: { title: '일시정지', items: [] },
+  };
+  for (const a of accounts){
+    cols[a.status === 'active' ? a.pool : 'paused'].items.push(a);
+  }
+  for (const c of Object.values(cols)){
+    c.items.sort((x,y) => remaining(x) - remaining(y));
+  }
+  board.innerHTML = Object.values(cols).map(c => `
+    <section class="col">
+      <h2>${c.title}<span class="count">${c.items.length}</span></h2>
+      ${c.items.map(card).join('') || '<div class="empty">없음</div>'}
+    </section>`).join('');
+  const active = accounts.filter(a => a.status === 'active').length;
+  meta.textContent = `${accounts.length}개 계정 (활성 ${active}) · ${new Date().toLocaleTimeString('ko-KR')}`;
+}
+
+async function load(){
+  try {
+    accounts = await api('/api/accounts');
+    err.textContent = '';
+    render();
+  } catch(e){
+    err.textContent = '로드 실패: ' + e.message;
+  }
+}
+
+board.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const cardEl = btn.closest('.card');
+  const [pool, slot] = cardEl.dataset.key.split('/');
+  const act = btn.dataset.act;
+  try {
+    if (act === 'enable' || act === 'disable') {
+      await api(`/api/accounts/${pool}/${slot}/enabled`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: act === 'enable'}) });
+    } else if (act === 'del') {
+      if (!confirm(`${pool}/${slot} 계정을 삭제할까요?`)) return;
+      await api(`/api/accounts/${pool}/${slot}`, { method:'DELETE' });
+    }
+    load();
+  } catch(e){ err.textContent = '실패: ' + e.message; }
+});
+
+board.addEventListener('change', async (ev) => {
+  const input = ev.target.closest('input[data-act]');
+  if (!input) return;
+  const cardEl = input.closest('.card');
+  const [pool, slot] = cardEl.dataset.key.split('/');
+  const act = input.dataset.act;
+  try {
+    if (act === 'weight') {
+      const w = Number(input.value);
+      if (!Number.isFinite(w) || w <= 0) throw new Error('가중치는 0보다 커야 함');
+      await api(`/api/accounts/${pool}/${slot}/weight`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({weight:w}) });
+    } else if (act === 'label') {
+      await api(`/api/accounts/${pool}/${slot}/label`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({label:input.value}) });
+    }
+    load();
+  } catch(e){ err.textContent = '실패: ' + e.message; }
+});
+
+$('#refresh').addEventListener('click', load);
+setInterval(() => { if ($('#auto').checked) load(); }, 30000);
+load();
+</script>
+</body>
+</html>
