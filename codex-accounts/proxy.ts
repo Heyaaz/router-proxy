@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto';
 import { initDb, listAccounts, latestUsage, usageScore } from './db.ts';
 
 type PoolName = 'chatgpt' | 'commandcode';
-type PoolEntry = { acct: string; token: string; accountId?: string | null; installId?: string | null; key?: string | null };
+type PoolEntry = { acct: string; token: string; accountId?: string | null; installId?: string | null; key?: string | null; enabled: number; weight: number };
 type Route = { pool: PoolName; path: string; unsupported?: boolean };
 type RouteRule = { pool: PoolName; test: RegExp };
 type ForwardOpts = { pool: PoolName; upstream: { hostname: string; port: number; base: string }; path: string };
@@ -48,10 +48,14 @@ function loadFromDb(): void {
     token: a.access_token ?? '',
     accountId: a.account_id,
     installId: a.install_id,
+    enabled: a.enabled,
+    weight: a.weight,
   })).filter((a) => a.token);
   commandcode = listAccounts('commandcode').map((a) => ({
     acct: a.slot,
     key: a.access_token ?? '',
+    enabled: a.enabled,
+    weight: a.weight,
   })).filter((a) => a.key);
   usage = latestUsage();
 }
@@ -64,7 +68,9 @@ function pick(pool: PoolName, sessionId: string): PoolEntry | null {
   const entries = pool === 'chatgpt' ? chatgpt : commandcode;
   if (entries.length === 0) return null;
   const now = Date.now() / 1000;
-  const scored = entries.map((e) => ({ e, s: usageScore(usage, pool, e.acct, now) }));
+  const scored = entries
+    .filter((e) => e.enabled !== 0)  // 비활성 계정 제외
+    .map((e) => ({ e, s: usageScore(usage, pool, e.acct, now) * (e.weight || 1) }));
   const usable = scored.filter((x) => x.s > 0);
   const source = usable.length > 0 ? usable : scored;
 

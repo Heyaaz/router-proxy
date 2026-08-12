@@ -58,10 +58,10 @@ ensure_dirs() {
 }
 
 if [ "$UNINSTALL" = true ]; then
-  for label in com.cc-accounts.proxy com.codex-accounts.proxy com.codex-accounts.quota; do
+  for label in com.cc-accounts.proxy com.codex-accounts.proxy com.codex-accounts.quota com.codex-accounts.control; do
     run launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
   done
-  for f in com.cc-accounts.proxy com.codex-accounts.proxy com.codex-accounts.quota; do
+  for f in com.cc-accounts.proxy com.codex-accounts.proxy com.codex-accounts.quota com.codex-accounts.control; do
     rm -f "$HOME_DIR/Library/LaunchAgents/$f.plist"
     say "plist 제거: $HOME_DIR/Library/LaunchAgents/$f.plist"
   done
@@ -79,8 +79,8 @@ fi
 
 if [ "$INSTALL_CODEX" = true ]; then
   ensure_dirs "$HOME_DIR/.codex-accounts"
-  run cp "$SCRIPT_DIR/codex-accounts/proxy.ts" "$SCRIPT_DIR/codex-accounts/login.ts" "$SCRIPT_DIR/codex-accounts/export-tokens.ts" "$SCRIPT_DIR/codex-accounts/db.ts" "$SCRIPT_DIR/codex-accounts/quota.ts" "$HOME_DIR/.codex-accounts/"
-  say "통합 프록시 + quota 설치: ~/.codex-accounts/ (:9091)"
+  run cp "$SCRIPT_DIR/codex-accounts/proxy.ts" "$SCRIPT_DIR/codex-accounts/login.ts" "$SCRIPT_DIR/codex-accounts/export-tokens.ts" "$SCRIPT_DIR/codex-accounts/db.ts" "$SCRIPT_DIR/codex-accounts/quota.ts" "$SCRIPT_DIR/codex-accounts/control.ts" "$HOME_DIR/.codex-accounts/"
+  say "통합 프록시 + quota + control 설치: ~/.codex-accounts/ (:9091, :9092)"
 fi
 
 # 2) plist 생성 (절대경로는 설치 시점에 $HOME으로 렌더링)
@@ -91,6 +91,7 @@ fi
 if [ "$INSTALL_CODEX" = true ]; then
   run render_plist "$SCRIPT_DIR/launchd/com.codex-accounts.proxy.plist.template" "$HOME_DIR/Library/LaunchAgents/com.codex-accounts.proxy.plist"
   run render_plist "$SCRIPT_DIR/launchd/com.codex-accounts.quota.plist.template" "$HOME_DIR/Library/LaunchAgents/com.codex-accounts.quota.plist"
+  run render_plist "$SCRIPT_DIR/launchd/com.codex-accounts.control.plist.template" "$HOME_DIR/Library/LaunchAgents/com.codex-accounts.control.plist"
 fi
 
 # 3) 데이터 디렉토리 (accounts.db + encryption.key)
@@ -110,6 +111,9 @@ if [ "$DRY_RUN" = false ]; then
     launchctl bootout "gui/$(id -u)/com.codex-accounts.quota" 2>/dev/null || true
     launchctl bootstrap "gui/$(id -u)" "$HOME_DIR/Library/LaunchAgents/com.codex-accounts.quota.plist"
     say "launchd 등록: com.codex-accounts.quota"
+    launchctl bootout "gui/$(id -u)/com.codex-accounts.control" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$HOME_DIR/Library/LaunchAgents/com.codex-accounts.control.plist"
+    say "launchd 등록: com.codex-accounts.control"
   fi
 else
   say "(dry-run) launchd bootstrap 생략"
@@ -121,5 +125,6 @@ say "  - Command Code 키:  ~/.cc-accounts/add-account.sh <a|b> [key]  (accounts
 say "  - ChatGPT 계정 추가: node ~/.codex-accounts/login.ts  (디바이스 로그인)"
 say "  - ChatGPT 토큰 갱신: node ~/.codex-accounts/export-tokens.ts --refresh"
 say "  - 사용량 수집:      launchd com.codex-accounts.quota (5분 간격)"
+say "  - 제어 API:        http://127.0.0.1:9092/api/accounts (QuotaBar 호환)"
 say "  - 프록시 확인:      curl http://127.0.0.1:9090/provider/v1/models  /  9091"
 say "  - 데이터:           ~/Documents/codex-accounts/accounts.db (+ encryption.key)"

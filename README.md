@@ -113,6 +113,26 @@ CLI helpers: `node ~/.codex-accounts/db.ts list|usage`
 Edit the `MODEL_ROUTES` table at the top of `codex-accounts/proxy.ts` to change
 the model routing.
 
+## Control API (:9092)
+
+Lightweight HTTP API for account management and routing control — no web UI.
+Also serves a QuotaBar-compatible `/api/accounts` endpoint (point QuotaBar at
+`CODEXBAR_ENDPOINT=http://127.0.0.1:9092`).
+
+```
+GET    /api/accounts                            → account list (QuotaBar schema)
+GET    /api/usage                               → latest usage snapshots
+GET    /api/health                              → status
+POST   /api/accounts/:pool/:slot/enabled        → {"enabled":true|false} pause/resume
+POST   /api/accounts/:pool/:slot/weight         → {"weight":1.5} routing weight
+POST   /api/accounts/:pool/:slot/label          → {"label":"work"} rename
+DELETE /api/accounts/:pool/:slot                → delete account
+```
+
+`pool` is `chatgpt` or `commandcode`; `slot` is the account id (`a`, `b`, `c`, …).
+Disabled accounts are excluded from routing; weight multiplies the usage score.
+CLI equivalents: `node ~/.codex-accounts/db.ts enable|disable|weight|label|del`.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -121,6 +141,7 @@ the model routing.
 | `CODEX_ACCOUNTS_DIR` | `~/Documents/codex-accounts` | SQLite DB + encryption.key directory |
 | `CODEX_ACCOUNTS_DB` | `$CODEX_ACCOUNTS_DIR/accounts.db` | Override DB path |
 | `CODEX_ACCOUNTS_KEY` | `$CODEX_ACCOUNTS_DIR/encryption.key` | Override key path |
+| `CONTROL_PORT` | `9092` | Control API port |
 
 ## Notes
 

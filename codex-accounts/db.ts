@@ -25,6 +25,8 @@ export type AccountRow = {
   email: string | null;
   install_id: string | null;
   plan_type: string | null;
+  enabled: number;      // 1 = 활성, 0 = 비활성 (라우팅 제외)
+  weight: number;       // 스코어 가중치 (기본 1.0)
   created_at: number;
   updated_at: number;
 };
@@ -113,6 +115,8 @@ export function initDb(): DatabaseSync {
       email TEXT,
       install_id TEXT,
       plan_type TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      weight REAL NOT NULL DEFAULT 1.0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       UNIQUE(pool, slot)
@@ -130,6 +134,10 @@ export function initDb(): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_usage_latest
       ON usage_snapshots(pool, slot, window, fetched_at DESC);
   `);
+  // 기존 DB 마이그레이션: enabled/weight 컬럼 추가
+  const cols = db.prepare(`PRAGMA table_info(accounts)`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === 'enabled')) db.exec(`ALTER TABLE accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`);
+  if (!cols.some((c) => c.name === 'weight')) db.exec(`ALTER TABLE accounts ADD COLUMN weight REAL NOT NULL DEFAULT 1.0`);
   _db = db;
   _key = getOrCreateKey();
   return db;
@@ -160,6 +168,8 @@ export function upsertAccount(a: {
   email?: string | null;
   installId?: string | null;
   planType?: string | null;
+  enabled?: number;
+  weight?: number;
 }): void {
   const db = initDb();
   const now = Math.floor(Date.now() / 1000);
@@ -171,17 +181,37 @@ export function upsertAccount(a: {
         label=COALESCE(?,label), access_token_enc=COALESCE(?,access_token_enc),
         refresh_token_enc=COALESCE(?,refresh_token_enc), account_id=COALESCE(?,account_id),
         email=COALESCE(?,email), install_id=COALESCE(?,install_id),
-        plan_type=COALESCE(?,plan_type), updated_at=?
+        plan_type=COALESCE(?,plan_type), enabled=COALESCE(?,enabled),
+        weight=COALESCE(?,weight), updated_at=?
       WHERE id=?
     `).run(a.label ?? null, enc(a.accessToken), enc(a.refreshToken), a.accountId ?? null,
-          a.email ?? null, a.installId ?? null, a.planType ?? null, now, existing.id);
+          a.email ?? null, a.installId ?? null, a.planType ?? null, a.enabled ?? null, a.weight ?? null, now, existing.id);
   } else {
     db.prepare(`
-      INSERT INTO accounts (pool,slot,label,access_token_enc,refresh_token_enc,account_id,email,install_id,plan_type,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO accounts (pool,slot,label,access_token_enc,refresh_token_enc,account_id,email,install_id,plan_type,enabled,weight,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(a.pool, a.slot, a.label ?? null, enc(a.accessToken), enc(a.refreshToken),
-           a.accountId ?? null, a.email ?? null, a.installId ?? null, a.planType ?? null, now, now);
+           a.accountId ?? null, a.email ?? null, a.installId ?? null, a.planType ?? null,
+           a.enabled ?? 1, a.weight ?? 1.0, now, now);
   }
+}
+
+export function setAccountEnabled(pool: Pool, slot: string, enabled: boolean): void {
+  const db = initDb();
+  db.prepare('UPDATE accounts SET enabled=?, updated_at=? WHERE pool=? AND slot=?')
+    .run(enabled ? 1 : 0, Math.floor(Date.now() / 1000), pool, slot);
+}
+
+export function setAccountWeight(pool: Pool, slot: string, weight: number): void {
+  const db = initDb();
+  db.prepare('UPDATE accounts SET weight=?, updated_at=? WHERE pool=? AND slot=?')
+    .run(weight, Math.floor(Date.now() / 1000), pool, slot);
+}
+
+export function updateAccountLabel(pool: Pool, slot: string, label: string | null): void {
+  const db = initDb();
+  db.prepare('UPDATE accounts SET label=?, updated_at=? WHERE pool=? AND slot=?')
+    .run(label, Math.floor(Date.now() / 1000), pool, slot);
 }
 
 export function listAccounts(pool?: Pool): AccountRow[] {
@@ -194,7 +224,9 @@ export function listAccounts(pool?: Pool): AccountRow[] {
     access_token: r.access_token_enc ? decrypt(r.access_token_enc as string) : null,
     refresh_token: r.refresh_token_enc ? decrypt(r.refresh_token_enc as string) : null,
     account_id: r.account_id ?? null, email: r.email ?? null, install_id: r.install_id ?? null,
-    plan_type: r.plan_type ?? null, created_at: r.created_at as number, updated_at: r.updated_at as number,
+    plan_type: r.plan_type ?? null,
+    enabled: (r.enabled as number) ?? 1, weight: (r.weight as number) ?? 1.0,
+    created_at: r.created_at as number, updated_at: r.updated_at as number,
   }));
 }
 
@@ -271,5 +303,20 @@ if (args.length > 0 && args[0] !== '--help') {
   } else if (args[0] === 'del-commandcode' && args[1]) {
     deleteAccount('commandcode', args[1]);
     console.log(`commandcode/${args[1]} 삭제됨`);
+  } else if (args[0] === 'enable' && args[1] && args[2]) {
+    setAccountEnabled(args[1] as Pool, args[2], true);
+    console.log(`${args[1]}/${args[2]} 활성화됨`);
+  } else if (args[0] === 'disable' && args[1] && args[2]) {
+    setAccountEnabled(args[1] as Pool, args[2], false);
+    console.log(`${args[1]}/${args[2]} 비활성화됨`);
+  } else if (args[0] === 'weight' && args[1] && args[2] && args[3]) {
+    setAccountWeight(args[1] as Pool, args[2], Number(args[3]));
+    console.log(`${args[1]}/${args[2]} 가중치 ${args[3]}`);
+  } else if (args[0] === 'label' && args[1] && args[2] && args[3]) {
+    updateAccountLabel(args[1] as Pool, args[2], args[3]);
+    console.log(`${args[1]}/${args[2]} 라벨: ${args[3]}`);
+  } else if (args[0] === 'del' && args[1] && args[2]) {
+    deleteAccount(args[1] as Pool, args[2]);
+    console.log(`${args[1]}/${args[2]} 삭제됨`);
   }
 }
