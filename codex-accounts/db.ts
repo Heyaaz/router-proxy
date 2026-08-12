@@ -135,13 +135,13 @@ export function initDb(): DatabaseSync {
   return db;
 }
 
-export function dbPath(): string { return DB_PATH; }
 export function keyPath(): string { return KEY_PATH; }
 
-export function encrypt(plaintext: string): string {
+// Fernet 헬퍼 (upsertAccount/listAccounts 내부에서만 사용)
+function encrypt(plaintext: string): string {
   return fernetEncrypt(getKey(), plaintext);
 }
-export function decrypt(token: string): string {
+function decrypt(token: string): string {
   return fernetDecrypt(getKey(), token);
 }
 function getKey(): string {
@@ -198,10 +198,6 @@ export function listAccounts(pool?: Pool): AccountRow[] {
   }));
 }
 
-export function getAccount(pool: Pool, slot: string): AccountRow | null {
-  return listAccounts(pool).find((a) => a.slot === slot) ?? null;
-}
-
 export function deleteAccount(pool: Pool, slot: string): void {
   const db = initDb();
   db.prepare('DELETE FROM accounts WHERE pool=? AND slot=?').run(pool, slot);
@@ -236,6 +232,26 @@ export function latestUsage(pool?: Pool): Record<string, Record<string, UsageRow
     }
   }
   return out;
+}
+
+// 사용량 스코어: remaining% / max(time_to_reset, 60s)
+// 높을수록 우선 — 리셋이 가깝고 사용량이 많이 남은 계정부터 태움 (쿼터 소진 방지)
+// 사용량 데이터가 없으면 0 (호출자가 라운드로빈 등으로 폴백)
+export function usageScore(
+  usage: Record<string, Record<string, UsageRow>>,
+  pool: Pool,
+  slot: string,
+  now: number,
+): number {
+  const u = usage[`${pool}:${slot}`];
+  if (!u) return 0;
+  const win = pool === 'chatgpt' ? 'primary' : u.weekly ? 'weekly' : 'fiveHour';
+  const w = u[win];
+  if (!w) return 0;
+  const remaining = Math.max(0, 100 - w.used_percent);
+  if (remaining <= 0) return 0;
+  const ttr = w.reset_at ? Math.max(60, w.reset_at - now) : 7 * 86400;
+  return remaining / ttr;
 }
 
 // CLI: node db.ts list|usage|key-path|add-commandcode <slot> <key>|del-commandcode <slot>

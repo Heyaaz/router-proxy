@@ -16,7 +16,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createHash } from 'node:crypto';
-import { initDb, listAccounts, latestUsage } from './db.ts';
+import { initDb, listAccounts, latestUsage, usageScore } from './db.ts';
 
 type PoolName = 'chatgpt' | 'commandcode';
 type PoolEntry = { acct: string; token: string; accountId?: string | null; installId?: string | null; key?: string | null };
@@ -59,25 +59,12 @@ loadFromDb();
 
 let rr = 0;
 
-// 사용량 스코어: remaining% / time_to_reset. 높을수록 우선 (리셋 가깝고 많이 남음)
-function scoreOf(pool: PoolName, slot: string, now: number): number {
-  const u = usage[`${pool}:${slot}`];
-  if (!u) return 0;
-  const win = pool === 'chatgpt' ? 'primary' : (u.weekly ? 'weekly' : 'fiveHour');
-  const w = u[win];
-  if (!w) return 0;
-  const remaining = Math.max(0, 100 - w.used_percent);
-  if (remaining <= 0) return 0;
-  const ttr = w.reset_at ? Math.max(60, w.reset_at - now) : 7 * 86400;
-  return remaining / ttr;
-}
-
 // 계정 선택: 세션 고정(쿼터 소진 계정 제외) + 사용량 스코어 + 라운드로빈 폴백
 function pick(pool: PoolName, sessionId: string): PoolEntry | null {
   const entries = pool === 'chatgpt' ? chatgpt : commandcode;
   if (entries.length === 0) return null;
   const now = Date.now() / 1000;
-  const scored = entries.map((e) => ({ e, s: scoreOf(pool, e.acct, now) }));
+  const scored = entries.map((e) => ({ e, s: usageScore(usage, pool, e.acct, now) }));
   const usable = scored.filter((x) => x.s > 0);
   const source = usable.length > 0 ? usable : scored;
 

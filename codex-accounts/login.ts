@@ -8,10 +8,10 @@
 // 플로우:
 //   deviceauth/usercode → 브라우저에서 https://auth.openai.com/codex/device 에
 //   코드 입력 → 폴링(deviceauth/token) → authorization_code면 PKCE 교환,
-//   아니면 토큰 직접 수신 → 슬롯 디렉토리에 token/refresh/id/install-id/email 저장.
+//   아니면 토큰 직접 수신 → accounts.db에 암호화 저장 (Fernet + encryption.key).
 //
-// 설정: CODEX_ACCOUNTS_DIR (기본 ~/Documents/codex-accounts)
-// 의존성: Node 18+ (내장 fetch/crypto만 사용)
+// 설정: CODEX_ACCOUNTS_DIR (기본 ~/Documents/codex-accounts, accounts.db)
+// 의존성: Node 18+ (내장 fetch/crypto/sqlite만 사용)
 
 import { randomUUID } from 'node:crypto';
 import { initDb, listAccounts, upsertAccount } from './db.ts';

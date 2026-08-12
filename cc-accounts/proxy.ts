@@ -12,7 +12,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createHash } from 'node:crypto';
-import { initDb, listAccounts, latestUsage } from './db.ts';
+import { initDb, listAccounts, latestUsage, usageScore } from './db.ts';
 
 type KeyEntry = { acct: string; key: string };
 
@@ -33,22 +33,10 @@ loadFromDb();
 
 let rr = 0;
 
-function scoreOf(slot: string, now: number): number {
-  const u = usage[`commandcode:${slot}`];
-  if (!u) return 0;
-  const win = u.weekly ? 'weekly' : 'fiveHour';
-  const w = u[win];
-  if (!w) return 0;
-  const remaining = Math.max(0, 100 - w.used_percent);
-  if (remaining <= 0) return 0;
-  const ttr = w.reset_at ? Math.max(60, w.reset_at - now) : 7 * 86400;
-  return remaining / ttr;
-}
-
 function pick(sessionId: string): KeyEntry | null {
   if (keys.length === 0) return null;
   const now = Date.now() / 1000;
-  const scored = keys.map((k) => ({ e: k, s: scoreOf(k.acct, now) }));
+  const scored = keys.map((k) => ({ e: k, s: usageScore(usage, 'commandcode', k.acct, now) }));
   const usable = scored.filter((x) => x.s > 0);
   const source = usable.length > 0 ? usable : scored;
   if (sessionId) {
