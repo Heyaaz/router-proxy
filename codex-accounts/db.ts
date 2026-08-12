@@ -156,14 +156,13 @@ export function initDb(): DatabaseSync {
   if (!cols.some((c) => c.name === 'enabled')) db.exec(`ALTER TABLE accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`);
   if (!cols.some((c) => c.name === 'weight')) db.exec(`ALTER TABLE accounts ADD COLUMN weight REAL NOT NULL DEFAULT 1.0`);
   if (!cols.some((c) => c.name === 'burn_priority')) db.exec(`ALTER TABLE accounts ADD COLUMN burn_priority INTEGER NOT NULL DEFAULT 0`);
-  // 기본 모델 라우트 시드 (없을 때만)
-  const routeCount = (db.prepare('SELECT COUNT(*) c FROM model_routes').get() as { c: number }).c;
-  if (routeCount === 0) {
-    const now = Math.floor(Date.now() / 1000);
-    const seed = db.prepare('INSERT INTO model_routes (pool, pattern, priority, enabled, created_at) VALUES (?,?,?,?,?)');
-    seed.run('chatgpt', '^(gpt-5\\.|gpt-4\\.|o[0-9]|codex-)', 10, 1, now);
-    seed.run('commandcode', '.*', 999, 1, now);
-  }
+  // 기본 모델 라우트 시드 (누락분만 추가 — 항상 catch-all 보장)
+  const now = Math.floor(Date.now() / 1000);
+  const seed = db.prepare('INSERT INTO model_routes (pool, pattern, priority, enabled, created_at) VALUES (?,?,?,?,?)');
+  const chatgptRoute = (db.prepare("SELECT COUNT(*) c FROM model_routes WHERE pool='chatgpt'").get() as { c: number }).c;
+  if (chatgptRoute === 0) seed.run('chatgpt', '^(gpt-5\\.|gpt-4\\.|o[0-9]|codex-)', 10, 1, now);
+  const ccCatchAll = (db.prepare("SELECT COUNT(*) c FROM model_routes WHERE pool='commandcode' AND pattern='.*'").get() as { c: number }).c;
+  if (ccCatchAll === 0) seed.run('commandcode', '.*', 999, 1, now);
   _db = db;
   _key = getOrCreateKey();
   return db;
