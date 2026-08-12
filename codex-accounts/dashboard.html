@@ -63,12 +63,13 @@ function pct(v){ return Math.max(0, Math.min(100, Math.round(v||0))); }
 function barColor(p){ return p >= 50 ? 'var(--green)' : p >= 20 ? 'var(--yellow)' : 'var(--red)'; }
 function fmtReset(ts){
   if (!ts) return '리셋 정보 없음';
-  const diff = ts*1000 - Date.now();
+  const t = typeof ts === 'string' ? new Date(ts).getTime() : ts*1000;
+  const diff = t - Date.now();
   if (diff <= 0) return '리셋됨';
   const d = Math.floor(diff/86400000), h = Math.floor(diff%86400000/3600000);
   return d > 0 ? `D-${d} ${h}시간` : h > 0 ? `${h}시간 후` : `${Math.max(1,Math.floor(diff/60000))}분 후`;
 }
-function shortName(a){ return (a.label || a.email || a.slot).split('@')[0].slice(0,14); }
+function shortName(a){ return (a.alias || a.displayName || a.email || a.accountId || '?').split('@')[0].slice(0,14); }
 function remaining(a){
   const u = a.usage || {};
   return u.primaryRemainingPercent ?? u.secondaryRemainingPercent ?? 100;
@@ -108,7 +109,7 @@ function card(a){
         ? '<button data-act="enable">재개</button>'
         : '<button data-act="disable">일시정지</button>'}
       <input type="number" step="0.1" min="0.1" value="${a.weight ?? 1}" title="가중치" data-act="weight">
-      <input type="text" value="${a.label || ''}" placeholder="라벨" title="라벨" data-act="label">
+      <input type="text" value="${a.alias || ''}" placeholder="라벨" title="라벨" data-act="label">
       <button class="danger" data-act="del">삭제</button>
     </div>
   </div>`;
@@ -137,7 +138,8 @@ function render(){
 
 async function load(){
   try {
-    accounts = await api('/api/accounts');
+    const res = await api('/api/accounts');
+    accounts = res.accounts ?? [];
     err.textContent = '';
     render();
   } catch(e){
