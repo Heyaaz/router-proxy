@@ -1,0 +1,8 @@
+#!/bin/bash
+# Command Code 프록시 경유 실행기
+#   cc -p "질문"            헤드리스
+#   cc                      인터랙티브
+#   cc status / cc whoami   상태 확인
+export COMMANDCODE_SANDBOX=true
+export COMMANDCODE_API_URL=http://127.0.0.1:9090
+exec cmd "$@"
