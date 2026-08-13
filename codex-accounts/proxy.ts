@@ -30,6 +30,14 @@ type ForwardOpts = { provider: Provider; path: string; query?: string };
 const PORT = Number(process.env.CC_PROXY_PORT ?? 9091);
 // 응답 헤더 대기 상한 (기본 90s) — dead keep-alive 소켓에 걸린 요청을 확실히 종료
 const UPSTREAM_TIMEOUT_MS = Number(process.env.PROXY_UPSTREAM_TIMEOUT_MS ?? 90_000);
+// mid-stream silent hang 방어: 응답 헤더 후 N초간 업스트림 데이터가 0이면 스트림 종료.
+// chatgpt.com은 SSE keepalive를 보내지 않음(실측 최대 무음 2.75s)이라 바이트 idle 기반으로
+// 감지한다. 0이면 비활성화. 부분 전송된 스트림은 안전하게 이어서 재시도할 수 없어 재시도 없음.
+const STREAM_IDLE_TIMEOUT_MS = Number(process.env.PROXY_STREAM_IDLE_TIMEOUT_MS ?? 180_000);
+// 요청당 최대 업스트림 시도 횟수 (초기 + 재시도). 401/429/타임아웃/일시적 커넥션 오류만 재시도.
+const MAX_UPSTREAM_ATTEMPTS = Number(process.env.PROXY_MAX_UPSTREAM_ATTEMPTS ?? 3);
+// 재시도 불가(영구) 오류 — TLS 인증서류는 재시도해도 같은 결과
+const PERMANENT_ERR_RE = /certificate|SELF_SIGNED|UNABLE_TO_VERIFY|ERR_TLS_CERT|EPROTO/i;
 
 const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}` : '***');
 
@@ -206,7 +214,7 @@ function forward(
       agent,
     },
     (up) => {
-      r.setTimeout(0); // 응답 헤더 수신 후엔 타임아웃 해제 (긴 SSE 스트림 보호)
+      r.setTimeout(0); // 응답 헤더 수신 후엔 연결 타임아웃 해제 — 이후는 idle watchdog이 감시
       const retriable = up.statusCode === 401 || up.statusCode === 429;
       if (retriable && onFail) {
         up.resume();
@@ -216,6 +224,36 @@ function forward(
       const tag = retriable ? `[${provider.id}:${chosen.acct}!!${up.statusCode}]` : `[${provider.id}:${chosen.acct}]`;
       console.log(`${ts} ${tag} ${req.method} ${opts.path} -> ${up.statusCode}`);
       res.writeHead(up.statusCode!, up.headers);
+      // mid-stream silent hang 방어: N초간 데이터가 안 오면 스트림 종료 (부분 전송 스트림은
+      // 안전하게 재시도할 수 없으므로 error 이벤트를 주고 끝낸다)
+      let idle: NodeJS.Timeout | null = null;
+      const clearIdle = () => {
+        if (idle) {
+          clearTimeout(idle);
+          idle = null;
+        }
+      };
+      const armIdle = () => {
+        if (STREAM_IDLE_TIMEOUT_MS <= 0) return;
+        clearIdle();
+        idle = setTimeout(() => {
+          idle = null;
+          console.log(
+            `${new Date().toISOString()} [${provider.id}:${chosen.acct}] ERR stream idle > ${STREAM_IDLE_TIMEOUT_MS / 1000}s`,
+          );
+          r.destroy();
+          if (!res.destroyed && !res.writableEnded) {
+            res.write(
+              `event: error\ndata: ${JSON.stringify({ type: 'error', code: 'upstream_idle_timeout', message: 'upstream stream idle timeout' })}\n\n`,
+            );
+            res.end();
+          }
+        }, STREAM_IDLE_TIMEOUT_MS);
+      };
+      up.on('data', armIdle);
+      up.on('end', clearIdle);
+      up.on('close', clearIdle);
+      armIdle();
       up.pipe(res);
     },
   );
@@ -230,8 +268,10 @@ function forward(
     if (!res.headersSent) res.writeHead(504).end('upstream timeout');
   });
   r.on('error', (e) => {
-    console.log(`${new Date().toISOString()} [${provider.id}:${chosen.acct}] ERR ${e.message}`);
-    if (onFail && !res.headersSent) return onFail(); // 응답 전 커넥션 오류 → 새 커넥션으로 1회 재시도
+    const msg = String(e?.message ?? e);
+    console.log(`${new Date().toISOString()} [${provider.id}:${chosen.acct}] ERR ${msg}`);
+    // TLS 인증서류(영구) 외 커넥션 오류는 일시적 — 응답 전이면 상한 내에서 재시도
+    if (onFail && !res.headersSent && !PERMANENT_ERR_RE.test(msg)) return onFail();
     res.destroy(e);
   });
   r.write(body);
@@ -302,10 +342,16 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
       return;
     }
     if (provider.id === 'chatgpt') body = normalizeChatgptBody(body);
+    const retries = { left: Math.max(0, MAX_UPSTREAM_ATTEMPTS - 1) };
     const next = () => {
+      if (retries.left <= 0) {
+        if (!res.headersSent) res.writeHead(504).end('upstream failed after retries');
+        return;
+      }
+      retries.left--;
       const pool = pools[provider.id] ?? [];
       const alt = pool.find((k) => k.acct !== chosen.acct) ?? chosen;
-      forward(req, res, body, alt, opts, null);
+      forward(req, res, body, alt, opts, next);
     };
     forward(req, res, body, chosen, opts, next);
   });

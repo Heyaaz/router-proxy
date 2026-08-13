@@ -169,6 +169,8 @@ CLI equivalents: `node ~/.codex-accounts/db.ts enable|disable|weight|label|del`.
 | `CODEX_ACCOUNTS_KEY` | `$CODEX_ACCOUNTS_DIR/encryption.key` | Override key path |
 | `CONTROL_PORT` | `9092` | Control API port |
 | `PROXY_UPSTREAM_TIMEOUT_MS` | `90000` | Upstream 응답 헤더 대기 상한 (dead keep-alive 소켓 방어) |
+| `PROXY_STREAM_IDLE_TIMEOUT_MS` | `180000` | mid-stream 무음 감시 (0 = off). 헤더 후 N초간 데이터 0이면 스트림 종료 |
+| `PROXY_MAX_UPSTREAM_ATTEMPTS` | `3` | 요청당 최대 업스트림 시도 횟수 (401/429/타임아웃/일시적 오류만 재시도) |
 | `CODEX_DASHBOARD` | `~/.codex-accounts/dashboard.html` | Dashboard HTML path |
 
 ## Notes
