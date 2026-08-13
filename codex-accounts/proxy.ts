@@ -34,13 +34,11 @@ const UPSTREAM_TIMEOUT_MS = Number(process.env.PROXY_UPSTREAM_TIMEOUT_MS ?? 90_0
 const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}` : '***');
 
 // 업스트림 TLS 연결 재사용 (요청마다 핸드셰이크 방지)
-const agent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 8,
-  // 재사용 풀을 작게 + free socket 수명을 15s로 줄여 stale 소켓 재사용 윈도우 최소화
-  maxFreeSockets: 2,
-  keepAliveMsecs: 15_000,
-});
+// Cloudflare가 idle keep-alive를 닫으면 Node가 CLOSE_WAIT 소켓을 free pool에서
+// 제때 정리하지 못해 재사용 시 socket hang up/무한 대기가 반복됐다 (2회 이상 발생).
+// 재사용을 끄고 요청마다 새 커넥션을 연다 — TLS 핸드셰이크 ~100ms는 수십 초짜리
+// codex 요청에는 영향이 미미하고, 죽은 소켓 계열 실패는 구조적으로 사라진다.
+const agent = new https.Agent({ keepAlive: false, maxSockets: 8 });
 
 // model_pattern 정규식 캐시 (provider id → RegExp)
 const regexCache = new Map<string, RegExp>();

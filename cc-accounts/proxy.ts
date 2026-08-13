@@ -24,13 +24,10 @@ const UPSTREAM = { hostname: 'api.commandcode.ai', port: 443 };
 const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}` : '***');
 
 // 업스트림 TLS 연결 재사용 (요청마다 핸드셰이크 방지)
-const agent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 8,
-  // 재사용 풀을 작게 + free socket 수명을 15s로 줄여 stale 소켓 재사용 윈도우 최소화
-  maxFreeSockets: 2,
-  keepAliveMsecs: 15_000,
-});
+// Cloudflare가 idle keep-alive를 닫으면 Node가 CLOSE_WAIT 소켓을 free pool에서
+// 제때 정리하지 못해 재사용 시 socket hang up/무한 대기가 반복됐다.
+// 재사용을 끄고 요청마다 새 커넥션을 연다 — 죽은 소켓 계열 실패는 구조적으로 사라진다.
+const agent = new https.Agent({ keepAlive: false, maxSockets: 8 });
 
 initDb();
 let keys: KeyEntry[] = [];
