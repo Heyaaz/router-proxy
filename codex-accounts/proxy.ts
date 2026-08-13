@@ -18,12 +18,14 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { initDb, listAccounts, latestUsage, usageScore, listProviders } from './db.ts';
 import type { Provider } from './db.ts';
 
 type PoolEntry = { acct: string; token: string; accountId?: string | null; installId?: string | null; enabled: number; weight: number; burn: number };
 type Route = { providerId: string; path: string; unsupported?: boolean };
-type ForwardOpts = { provider: Provider; path: string };
+type ForwardOpts = { provider: Provider; path: string; query?: string };
 
 const PORT = Number(process.env.CC_PROXY_PORT ?? 9091);
 
@@ -120,6 +122,31 @@ function normalizeChatgptBody(body: Buffer): Buffer {
   }
 }
 
+// ---------- auth.json 포워딩 ----------
+// codex CLI는 ChatGPT 데스크톱 앱이 갱신해주는 ~/.codex/auth.json을 쓴다.
+// env_key 없이도 그 토큰을 쓰도록 프록시가 최근 토큰을 자동 주입한다.
+// auth.json 없으면 → chatgpt 풀 토큰 포워딩 (account-id 헤더 포함)
+
+function authJsonToken(): string | null {
+  try {
+    const p = `${homedir()}/.codex/auth.json`;
+    const a = JSON.parse(readFileSync(p, 'utf8')) as { tokens?: { access_token?: string; account_id?: string } };
+    return a.tokens?.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function authJsonAccountId(): string | null {
+  try {
+    const p = `${homedir()}/.codex/auth.json`;
+    const a = JSON.parse(readFileSync(p, 'utf8')) as { tokens?: { access_token?: string; account_id?: string } };
+    return a.tokens?.account_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function forward(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -141,7 +168,13 @@ function forward(
   if (provider.auth_mode === 'none') {
     // 인증 없음 (로컬 Ollama/LM Studio 등) — 토큰 불필요
   } else if (provider.auth_header.toLowerCase() === 'authorization') {
-    headers.authorization = `Bearer ${chosen.token}`;
+    // chatgpt: 데스크톱 앱이 갱신하는 auth.json 토큰을 우선 사용하되,
+    // 선택된 계정과 동일 계정일 때만 (로테이션/사용량 귀속 유지)
+    const ajTok = authJsonToken();
+    const ajAcct = authJsonAccountId();
+    const at =
+      provider.id === 'chatgpt' && ajTok && ajAcct && chosen.accountId === ajAcct ? ajTok : chosen.token;
+    headers.authorization = `Bearer ${at}`;
     if (provider.account_id_header && chosen.accountId) headers[provider.account_id_header] = chosen.accountId;
     if (provider.id === 'chatgpt' && chosen.installId) headers['x-codex-installation-id'] = chosen.installId;
   } else {
@@ -149,9 +182,8 @@ function forward(
   }
   headers.host = provider.base_url.replace(/^https?:\/\//, '').split('/')[0];
 
-  const upstreamPath = opts.path.startsWith(provider.path_prefix)
-    ? opts.path
-    : `${provider.path_prefix}${opts.path}`;
+  const upstreamPath =
+    (opts.path.startsWith(provider.path_prefix) ? opts.path : `${provider.path_prefix}${opts.path}`) + (opts.query ?? '');
 
   const url = new URL(provider.base_url);
   const r = https.request(
@@ -185,6 +217,11 @@ function forward(
 }
 
 function routeFor(path: string, body: Buffer): Route | null {
+  // Codex CLI (wire_api=responses) → {base}/responses, {base}/models → chatgpt 풀
+  if (path === '/responses' || path === '/models') {
+    const gpt = providers.find((p) => p.id === 'chatgpt');
+    if (gpt) return { providerId: 'chatgpt', path: `${gpt.path_prefix}${path}` };
+  }
   // 명시 경로 → 프로바이더
   for (const p of providers) {
     if (path.startsWith(p.path_prefix)) return { providerId: p.id, path };
@@ -192,14 +229,12 @@ function routeFor(path: string, body: Buffer): Route | null {
   if (path.startsWith('/v1/')) {
     const rest = path.slice('/v1'.length);
     let model = '';
-    // 바디에서 model 필드만 추출 — 전체 JSON.parse는 최소화
     try {
       const s = body.toString('utf8');
-      // "model":"..." 패턴만 빠르게 추출
       const m = s.match(/"model"\s*:\s*"([^"]+)"/);
       model = m ? m[1]! : '';
     } catch {}
-        for (const p of providers) {
+    for (const p of providers) {
       try {
         if (patternRe(p).test(model)) {
           // chatgpt는 Responses/모델 카탈로그만 (chat/completions 미지원)
@@ -220,7 +255,8 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
   req.on('data', (c) => chunks.push(c as Buffer));
   req.on('end', () => {
     let body = Buffer.concat(chunks);
-    const route = routeFor(req.url ?? '', body);
+    const u = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const route = routeFor(u.pathname, body);
     if (!route) {
       res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ detail: 'no route' }));
       return;
@@ -237,7 +273,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
       return;
     }
     const sessionId = (req.headers['x-session-id'] as string | undefined) ?? '';
-    const opts: ForwardOpts = { provider, path: route.path };
+    const opts: ForwardOpts = { provider, path: route.path, query: u.search };
     const chosen = pick(provider.id, sessionId);
     if (!chosen) {
       res.writeHead(503).end(`no ${provider.id} accounts in accounts.db`);
