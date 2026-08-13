@@ -28,11 +28,19 @@ type Route = { providerId: string; path: string; unsupported?: boolean };
 type ForwardOpts = { provider: Provider; path: string; query?: string };
 
 const PORT = Number(process.env.CC_PROXY_PORT ?? 9091);
+// 응답 헤더 대기 상한 (기본 90s) — dead keep-alive 소켓에 걸린 요청을 확실히 종료
+const UPSTREAM_TIMEOUT_MS = Number(process.env.PROXY_UPSTREAM_TIMEOUT_MS ?? 90_000);
 
 const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}` : '***');
 
 // 업스트림 TLS 연결 재사용 (요청마다 핸드셰이크 방지)
-const agent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
+const agent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 8,
+  // 재사용 풀을 작게 + free socket 수명을 15s로 줄여 stale 소켓 재사용 윈도우 최소화
+  maxFreeSockets: 2,
+  keepAliveMsecs: 15_000,
+});
 
 // model_pattern 정규식 캐시 (provider id → RegExp)
 const regexCache = new Map<string, RegExp>();
@@ -186,6 +194,10 @@ function forward(
     (opts.path.startsWith(provider.path_prefix) ? opts.path : `${provider.path_prefix}${opts.path}`) + (opts.query ?? '');
 
   const url = new URL(provider.base_url);
+  // 클라이언트가 응답을 받기 전에 연결을 끊으면 업스트림 요청도 즉시 중단 (토큰 낭비 방지)
+  res.on('close', () => {
+    if (!res.writableFinished) r.destroy();
+  });
   const r = https.request(
     {
       hostname: url.hostname,
@@ -196,6 +208,7 @@ function forward(
       agent,
     },
     (up) => {
+      r.setTimeout(0); // 응답 헤더 수신 후엔 타임아웃 해제 (긴 SSE 스트림 보호)
       const retriable = up.statusCode === 401 || up.statusCode === 429;
       if (retriable && onFail) {
         up.resume();
@@ -208,8 +221,19 @@ function forward(
       up.pipe(res);
     },
   );
+  // 응답 헤더가 도착하기 전에 걸린 요청(dead keep-alive 소켓 등)은 상한 후
+  // 소켓을 버리고 재시도(alt 계정, 새 커넥션)하거나 504를 돌려준다.
+  r.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+    console.log(
+      `${new Date().toISOString()} [${provider.id}:${chosen.acct}] ERR timeout (no response in ${UPSTREAM_TIMEOUT_MS / 1000}s)`,
+    );
+    r.destroy();
+    if (onFail) return onFail();
+    if (!res.headersSent) res.writeHead(504).end('upstream timeout');
+  });
   r.on('error', (e) => {
     console.log(`${new Date().toISOString()} [${provider.id}:${chosen.acct}] ERR ${e.message}`);
+    if (onFail && !res.headersSent) return onFail(); // 응답 전 커넥션 오류 → 새 커넥션으로 1회 재시도
     res.destroy(e);
   });
   r.write(body);

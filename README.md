@@ -168,6 +168,7 @@ CLI equivalents: `node ~/.codex-accounts/db.ts enable|disable|weight|label|del`.
 | `CODEX_ACCOUNTS_DB` | `$CODEX_ACCOUNTS_DIR/accounts.db` | Override DB path |
 | `CODEX_ACCOUNTS_KEY` | `$CODEX_ACCOUNTS_DIR/encryption.key` | Override key path |
 | `CONTROL_PORT` | `9092` | Control API port |
+| `PROXY_UPSTREAM_TIMEOUT_MS` | `90000` | Upstream 응답 헤더 대기 상한 (dead keep-alive 소켓 방어) |
 | `CODEX_DASHBOARD` | `~/.codex-accounts/dashboard.html` | Dashboard HTML path |
 
 ## Notes

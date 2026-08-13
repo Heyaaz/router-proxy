@@ -124,6 +124,7 @@ let _key: string | null = null;
 export function initDb(): DatabaseSync {
   if (_db) return _db;
   const db = new DatabaseSync(DB_PATH);
+  db.exec('PRAGMA busy_timeout = 5000'); // proxy/control/quota 동시 쓰기 충돌 대기
   db.exec(`
     CREATE TABLE IF NOT EXISTS accounts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
