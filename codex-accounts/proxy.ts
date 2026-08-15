@@ -17,6 +17,7 @@
 
 import http from 'node:http';
 import https from 'node:https';
+import net from 'node:net';
 import tls from 'node:tls';
 import type { Duplex } from 'node:stream';
 import { createHash } from 'node:crypto';
@@ -58,6 +59,7 @@ const mask = (k: string) => (k.length > 12 ? `${k.slice(0, 8)}...${k.slice(-4)}`
 // 제때 정리하지 못해 재사용 시 socket hang up/무한 대기가 반복됐다 (2회 이상 발생).
 // 재사용을 끄고 요청마다 새 커넥션을 연다 — TLS 핸드셰이크 ~100ms는 수십 초짜리
 // codex 요청에는 영향이 미미하고, 죽은 소켓 계열 실패는 구조적으로 사라진다.
+const httpAgent = new http.Agent({ keepAlive: false, maxSockets: 8 });
 const agent = new https.Agent({ keepAlive: false, maxSockets: 8 });
 
 // model_pattern 정규식 캐시 (provider id → RegExp)
@@ -99,29 +101,96 @@ loadFromDb();
 
 let rr = 0;
 
-// 계정 선택: 세션 고정 + 사용량 스코어 + weight/burn
+// ---------- 세션 어피니티 캐시 ----------
+// sha1(sessionId) % N 방식은 풀 크기 변화(계정 추가/삭제/비활성화, 5분 쿼터 갱신)만으로
+// 전 세션의 피닝이 리매핑됐다. TTL 캐시로 계정을 고정하고, 401/429 재시도 시 리바인딩한다.
+const AFFINITY_TTL_MS = Number(process.env.PROXY_AFFINITY_TTL_MS ?? 600_000);
+const affinity = new Map<string, { acct: string; expires: number }>();
+
+function affinityKey(providerId: string, sessionId: string): string {
+  return `${providerId}:${sessionId}`;
+}
+function affinityGet(providerId: string, sessionId: string): PoolEntry | null {
+  if (!sessionId) return null;
+  const hit = affinity.get(affinityKey(providerId, sessionId));
+  if (!hit || hit.expires < Date.now()) return null;
+  return (pools[providerId] ?? []).find((e) => e.acct === hit.acct && e.enabled !== 0) ?? null;
+}
+function affinitySet(providerId: string, sessionId: string, acct: string): void {
+  if (!sessionId) return;
+  // 만료 엔트리 청소 (세션 수가 많아질 때만 — 맵이 작아 평시 비용 없음)
+  if (affinity.size > 1024) {
+    const now = Date.now();
+    for (const [k, v] of affinity) if (v.expires < now) affinity.delete(k);
+  }
+  affinity.set(affinityKey(providerId, sessionId), { acct, expires: Date.now() + AFFINITY_TTL_MS });
+}
+
+// 라우팅 결정 트레이스 — 요청당 1줄 JSON. "왜 이 계정인가"를 로그 재계산 없이 답하게 한다.
+function traceDecision(t: Record<string, unknown>): void {
+  console.log(`${new Date().toISOString()} ROUTE ${JSON.stringify(t)}`);
+}
+
+// 계정 선택: 세션 어피니티 → 사용량 스코어 + weight/burn
 function pick(providerId: string, sessionId: string): PoolEntry | null {
   const entries = pools[providerId] ?? [];
   if (entries.length === 0) return null;
   const now = Date.now() / 1000;
+
+  const pinned = affinityGet(providerId, sessionId);
+  if (pinned) {
+    traceDecision({ provider: providerId, session: sessionId || null, chosen: pinned.acct, affinity: 'hit' });
+    return pinned;
+  }
+
   const scored = entries
     .filter((e) => e.enabled !== 0)
     .map((e) => ({ e, s: usageScore(usage, providerId as any, e.acct, now) * (e.weight || 1) + (e.burn || 0) * 1000 }));
   const usable = scored.filter((x) => x.s > 0);
   const source = usable.length > 0 ? usable : scored;
+  if (source.length === 0) return null; // 활성 계정 없음 → 호출자가 503
 
+  // 후보별 스코어/제외사유 — 트레이스용
+  const candidates = entries.map((e) => {
+    if (e.enabled === 0) return { slot: e.acct, excluded: 'disabled' };
+    const s = usageScore(usage, providerId as any, e.acct, now) * (e.weight || 1) + (e.burn || 0) * 1000;
+    return { slot: e.acct, score: Math.round(s * 1000) / 1000, weight: e.weight || 1, burn: e.burn || 0 };
+  });
+
+  let chosen: PoolEntry;
+  let method: string;
   if (sessionId) {
     const h = parseInt(createHash('sha1').update(sessionId).digest('hex').slice(0, 8), 16);
-    return source[h % source.length]!.e;
+    chosen = source[h % source.length]!.e;
+    method = 'session-hash';
+  } else {
+    const total = source.reduce((a, x) => a + x.s, 0);
+    if (total <= 0) {
+      chosen = scored[rr++ % scored.length]!.e; // 활성 계정 간에만 라운드로빈
+      method = 'round-robin';
+    } else {
+      let r = Math.random() * total;
+      chosen = source[source.length - 1]!.e;
+      for (const x of source) {
+        r -= x.s;
+        if (r <= 0) {
+          chosen = x.e;
+          break;
+        }
+      }
+      method = 'weighted-random';
+    }
   }
-  const total = source.reduce((a, x) => a + x.s, 0);
-  if (total <= 0) return entries[rr++ % entries.length]!;
-  let r = Math.random() * total;
-  for (const x of source) {
-    r -= x.s;
-    if (r <= 0) return x.e;
-  }
-  return source[source.length - 1]!.e;
+  affinitySet(providerId, sessionId, chosen.acct);
+  traceDecision({
+    provider: providerId,
+    session: sessionId || null,
+    method,
+    fallback: usable.length === 0,
+    chosen: chosen.acct,
+    candidates,
+  });
+  return chosen;
 }
 
 // ChatGPT Responses 페이로드 정규화 (chatgpt 프로바이더 전용)
@@ -224,14 +293,16 @@ function forward(
   res.on('close', () => {
     if (!res.writableFinished) r.destroy();
   });
-  const r = https.request(
+  // http:// (로컬 Ollama/LM Studio 등)와 https:// 업스트림 모두 지원
+  const secure = url.protocol !== 'http:';
+  const r = (secure ? https.request : http.request)(
     {
       hostname: url.hostname,
-      port: url.port ? Number(url.port) : 443,
+      port: url.port ? Number(url.port) : secure ? 443 : 80,
       method: req.method,
       path: upstreamPath,
       headers,
-      agent,
+      agent: secure ? agent : httpAgent,
     },
     (up) => {
       r.setTimeout(0); // 응답 헤더 수신 후엔 연결 타임아웃 해제 — 이후는 idle watchdog이 감시
@@ -303,7 +374,7 @@ function forward(
 }
 
 // ---------- WebSocket 터널링 (wire_api=responses_websocket 대응) ----------
-// https.request는 101 upgrade를 중계할 수 없어 raw TLS 소켓 터널을 연다.
+// https.request는 101 upgrade를 중계할 수 없어 raw 소켓 터널을 연다 (https: TLS, http: 평문).
 // 업스트림이 101을 돌려주면 양방향 파이프, 401/429/5xx면 계정을 바꿔 백오프 재시도.
 // 주의: WS 프레임 페이로드는 중간 수정이 불가 — normalizeChatgptBody 미적용.
 function handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
@@ -349,11 +420,10 @@ function handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer):
     }
     headers.host = provider.base_url.replace(/^https?:\/\//, '').split('/')[0];
 
-    const up = tls.connect({
-      host: url.hostname,
-      port: url.port ? Number(url.port) : 443,
-      servername: url.hostname,
-    });
+    const up =
+      url.protocol === 'http:'
+        ? net.connect({ host: url.hostname, port: url.port ? Number(url.port) : 80 })
+        : tls.connect({ host: url.hostname, port: url.port ? Number(url.port) : 443, servername: url.hostname });
     let established = false;
     let buf = Buffer.alloc(0);
     const onClientGone = () => up.destroy();
@@ -364,7 +434,7 @@ function handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer):
       if (n < Math.max(1, MAX_UPSTREAM_ATTEMPTS)) {
         console.log(`${new Date().toISOString()} [${provider.id}:${chosen.acct}] WS retry (${why})`);
         const pool = pools[provider.id] ?? [];
-        const alt = pool.find((k) => !tried.has(k.acct)) ?? chosen;
+        const alt = pool.find((k) => k.enabled !== 0 && !tried.has(k.acct)) ?? chosen;
         setTimeout(() => attempt(alt), RETRY_BACKOFF_MS * n);
       } else {
         fail(504, `websocket upstream failed after retries (${why})`);
@@ -465,8 +535,9 @@ function routeFor(path: string, body: Buffer): Route | null {
     let model = '';
     try {
       const s = body.toString('utf8');
-      const m = s.match(/"model"\s*:\s*"([^"]+)"/);
-      model = m ? m[1]! : '';
+      // top-level "model"만 신뢰 — 정규식 첫 매치는 툴 인자 등 중첩 JSON의 "model"을 오매칭할 수 있음
+      const parsed = JSON.parse(s) as { model?: unknown };
+      model = typeof parsed.model === 'string' ? parsed.model : '';
     } catch {}
     for (const p of providers) {
       try {
@@ -526,9 +597,11 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
       retries.left--;
       retries.n++;
       const pool = pools[provider.id] ?? [];
-      // 아직 시도 안 한 계정 우선 — 모두 시도했으면 최초 계정 재사용
-      const alt = pool.find((k) => !tried.has(k.acct)) ?? chosen;
+      // 아직 시도 안 한 활성 계정 우선 — 모두 시도했으면 최초 계정 재사용
+      const alt = pool.find((k) => k.enabled !== 0 && !tried.has(k.acct)) ?? chosen;
       tried.add(alt.acct);
+      affinitySet(provider.id, sessionId, alt.acct); // 401/429 → 해당 세션을 살아있는 계정으로 리바인딩
+      traceDecision({ provider: provider.id, session: sessionId || null, retry: retries.n, chosen: alt.acct, tried: [...tried] });
       setTimeout(() => {
         if (!res.destroyed && !res.writableEnded) forward(req, res, body, alt, opts, next);
       }, RETRY_BACKOFF_MS * (retries.n - 1));

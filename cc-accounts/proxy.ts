@@ -196,8 +196,8 @@ http
         }
         retries.left--;
         retries.n++;
-        // 아직 시도 안 한 계정 우선 (라운드로빈 순서) — 모두 시도했으면 최초 계정 재사용
-        const alt = keys.find((k) => !tried.has(k.acct)) ?? chosen;
+        // 아직 시도 안 한 활성 계정 우선 (라운드로빈 순서) — 모두 시도했으면 최초 계정 재사용
+        const alt = keys.find((k) => k.enabled !== 0 && !tried.has(k.acct)) ?? chosen;
         tried.add(alt.acct);
         setTimeout(() => {
           if (!res.destroyed && !res.writableEnded) forward(req, res, body, alt, next);
