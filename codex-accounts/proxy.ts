@@ -397,9 +397,11 @@ function handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer):
   const url = new URL(provider.base_url);
   const tried = new Set<string>();
   let n = 0;
+  let retrying = false; // retry()가 up을 destroy하면 close가 다시 발생 — 이중 재시도 방지 (attempt마다 해제)
 
   const attempt = (chosen: PoolEntry): void => {
     if (socket.destroyed) return;
+    retrying = false; // 새 시도 시작 — 이전 시도의 재시도 가드 해제 (close/error 연쇄 방지)
     tried.add(chosen.acct);
     n++;
     const headers: Record<string, string | string[] | undefined> = { ...req.headers };
@@ -420,21 +422,36 @@ function handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer):
     }
     headers.host = provider.base_url.replace(/^https?:\/\//, '').split('/')[0];
 
+    const sendUpgrade = () => {
+      const lines: string[] = [];
+      for (const [k, v] of Object.entries(headers)) {
+        if (v == null) continue;
+        if (Array.isArray(v)) for (const x of v) lines.push(`${k}: ${x}`);
+        else lines.push(`${k}: ${v}`);
+      }
+      up.write(`${req.method} ${upstreamPath} HTTP/1.1\r\n${lines.join('\r\n')}\r\n\r\n`);
+      if (head.length) up.write(head);
+    };
+    // secureConnect는 TLS 전용 — 평문(net.connect)은 connect 콜백으로 프레임을 쓴다
     const up =
       url.protocol === 'http:'
-        ? net.connect({ host: url.hostname, port: url.port ? Number(url.port) : 80 })
-        : tls.connect({ host: url.hostname, port: url.port ? Number(url.port) : 443, servername: url.hostname });
+        ? net.connect({ host: url.hostname, port: url.port ? Number(url.port) : 80 }, sendUpgrade)
+        : tls.connect({ host: url.hostname, port: url.port ? Number(url.port) : 443, servername: url.hostname }, sendUpgrade);
     let established = false;
     let buf = Buffer.alloc(0);
     const onClientGone = () => up.destroy();
     socket.on('close', onClientGone);
     const retry = (why: string): void => {
+      if (retrying) return;
+      retrying = true;
       up.destroy();
       if (socket.destroyed) return;
       if (n < Math.max(1, MAX_UPSTREAM_ATTEMPTS)) {
         console.log(`${new Date().toISOString()} [${provider.id}:${chosen.acct}] WS retry (${why})`);
         const pool = pools[provider.id] ?? [];
         const alt = pool.find((k) => k.enabled !== 0 && !tried.has(k.acct)) ?? chosen;
+        affinitySet(provider.id, sessionId, alt.acct); // 세션을 살아있는 계정으로 리바인딩 (HTTP 경로와 동일)
+        traceDecision({ provider: provider.id, session: sessionId || null, retry: n, transport: 'ws', chosen: alt.acct, tried: [...tried] });
         setTimeout(() => attempt(alt), RETRY_BACKOFF_MS * n);
       } else {
         fail(504, `websocket upstream failed after retries (${why})`);
@@ -444,15 +461,9 @@ function handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer):
     up.setTimeout(WS_CONNECT_TIMEOUT_MS, () => {
       if (!established) retry(`no response in ${WS_CONNECT_TIMEOUT_MS / 1000}s`);
     });
-    up.on('secureConnect', () => {
-      const lines: string[] = [];
-      for (const [k, v] of Object.entries(headers)) {
-        if (v == null) continue;
-        if (Array.isArray(v)) for (const x of v) lines.push(`${k}: ${x}`);
-        else lines.push(`${k}: ${v}`);
-      }
-      up.write(`${req.method} ${upstreamPath} HTTP/1.1\r\n${lines.join('\r\n')}\r\n\r\n`);
-      if (head.length) up.write(head);
+    // 핸드셰이크 전 업스트림이 조용히 연결을 닫으면(FIN, 에러 아님) 재시도 — 방치하면 클라이언트가 타임아웃까지 hang
+    up.on('close', () => {
+      if (!established && !socket.destroyed) retry('upstream closed before response');
     });
     up.on('data', (chunk: Buffer) => {
       if (established) return;
