@@ -34,6 +34,13 @@ codex가 `chatgpt.com`에 직접 붙지 않고, 로컬 계정 라우팅 프록�
   `routeFor()`에 추가.
 - `/models?client_version=…` 같은 query string이 잘리지 않도록 `handle()`에서
   `URL.pathname`/`URL.search`를 분리해 업스트림에 재결합.
+- `/v1/responses`, `/v1/models`(OpenAI 호환 경로, GJC models.yml 등이 사용)도 동일하게
+  chatgpt 프로바이더로 라우팅. GET은 body가 없어 모델 매칭이 불가하므로 정적 라우트가 유일한 진입로다.
+- `/v1/*` 모델 패턴 매칭은 catch-all(`.*`) 프로바이더를 순회 마지막으로 정렬 —
+  등록 순서가 아니라 패턴 구체성이 우선한다 (`loadFromDb()`).
+- `GET /healthz` 로컬 진단 엔드포인트: `{"ok":true,"providers":{...},"uptime_s":...}` —
+  프록시 기동/계정풀 상태 원샷 확인. 업스트림 미경유.
+- ROUTE 트레이스에 `model` 필드 추가 — 어떤 모델이 어느 프로바이더/계정으로 갔는지 로그로 추적 가능.
 - `env_key` 없이도 동작하도록 `~/.codex/auth.json` 토큰 자동 주입:
   ChatGPT 데스크톱 앱이 갱신해주는 `auth.json`의 `access_token`을 읽어, 프록시가
   선택한 계정과 `account_id`가 일치할 때만 그 토큰으로 교체해 업스트림에 전달.

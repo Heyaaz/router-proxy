@@ -43,14 +43,6 @@ export type AccountRow = {
   created_at: number;
   updated_at: number;
 };
-export type ModelRoute = {
-  id: number;
-  pool: Pool;
-  pattern: string;      // 정규식 패턴
-  priority: number;     // 낮을수록 먼저 매치
-  enabled: number;
-  created_at: number;
-};
 export type UsageRow = {
   pool: Pool;
   slot: string;
@@ -358,37 +350,8 @@ export function getProvider(id: string): Provider | null {
 }
 
 // ---------- model_routes ----------
-export function listModelRoutes(): ModelRoute[] {
-  const db = initDb();
-  const rows = db.prepare('SELECT * FROM model_routes ORDER BY priority, id').all();
-  return (rows as any[]).map((r) => ({
-    id: r.id as number, pool: r.pool as Pool, pattern: r.pattern as string,
-    priority: r.priority as number, enabled: r.enabled as number, created_at: r.created_at as number,
-  }));
-}
-
-export function upsertModelRoute(r: {
-  id?: number;
-  pool: Pool;
-  pattern: string;
-  priority?: number;
-  enabled?: number;
-}): void {
-  const db = initDb();
-  const now = Math.floor(Date.now() / 1000);
-  if (r.id) {
-    db.prepare('UPDATE model_routes SET pool=?, pattern=?, priority=?, enabled=?, created_at=created_at WHERE id=?')
-      .run(r.pool, r.pattern, r.priority ?? 100, r.enabled ?? 1, r.id);
-  } else {
-    db.prepare('INSERT INTO model_routes (pool, pattern, priority, enabled, created_at) VALUES (?,?,?,?,?)')
-      .run(r.pool, r.pattern, r.priority ?? 100, r.enabled ?? 1, now);
-  }
-}
-
-export function deleteModelRoute(id: number): void {
-  const db = initDb();
-  db.prepare('DELETE FROM model_routes WHERE id=?').run(id);
-}
+// (제거: 2026-08-17 — CRUD 호출자가 없었다. /v1/* 모델 라우팅은 providers.model_pattern
+//  + catch-all-last 정렬(proxy.ts loadFromDb)로 결정된다. 테이블은 호환을 위해 유지.)
 
 export function deleteAccount(pool: Pool, slot: string): void {
   const db = initDb();

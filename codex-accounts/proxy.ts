@@ -27,7 +27,8 @@ import { initDb, listAccounts, latestUsage, usageScore, listProviders } from './
 import type { Provider } from './db.ts';
 
 type PoolEntry = { acct: string; token: string; accountId?: string | null; installId?: string | null; enabled: number; weight: number; burn: number };
-type Route = { providerId: string; path: string; unsupported?: boolean };
+type Route = { providerId: string; path: string; unsupported?: boolean; model?: string };
+
 type ForwardOpts = { provider: Provider; path: string; query?: string };
 
 const PORT = Number(process.env.CC_PROXY_PORT ?? 9091);
@@ -81,6 +82,9 @@ let usage = latestUsage();
 
 function loadFromDb(): void {
   providers = listProviders().filter((p) => p.enabled === 1);
+  // catch-all(.*) 패턴을 순회 마지막으로 — /v1/* 모델 매칭이 등록 순서가 아니라
+  // 패턴 구체성으로 결정되게 한다. (.*가 먼저 오면 구체 패턴이 전부 무시됨)
+  providers.sort((a, b) => Number(a.model_pattern === '.*') - Number(b.model_pattern === '.*'));
   // 프로바이더 id가 바뀌었으면 정규식 캐시 정리
   const ids = new Set(providers.map((p) => p.id));
   for (const k of regexCache.keys()) if (!ids.has(k)) regexCache.delete(k);
@@ -97,6 +101,7 @@ function loadFromDb(): void {
   }
   usage = latestUsage();
 }
+
 loadFromDb();
 
 let rr = 0;
@@ -132,14 +137,15 @@ function traceDecision(t: Record<string, unknown>): void {
 }
 
 // 계정 선택: 세션 어피니티 → 사용량 스코어 + weight/burn
-function pick(providerId: string, sessionId: string): PoolEntry | null {
+function pick(providerId: string, sessionId: string, model?: string): PoolEntry | null {
+
   const entries = pools[providerId] ?? [];
   if (entries.length === 0) return null;
   const now = Date.now() / 1000;
 
   const pinned = affinityGet(providerId, sessionId);
   if (pinned) {
-    traceDecision({ provider: providerId, session: sessionId || null, chosen: pinned.acct, affinity: 'hit' });
+    traceDecision({ provider: providerId, session: sessionId || null, model: model ?? null, chosen: pinned.acct, affinity: 'hit' });
     return pinned;
   }
 
@@ -185,6 +191,7 @@ function pick(providerId: string, sessionId: string): PoolEntry | null {
   traceDecision({
     provider: providerId,
     session: sessionId || null,
+    model: model ?? null,
     method,
     fallback: usable.length === 0,
     chosen: chosen.acct,
@@ -532,10 +539,12 @@ function handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer):
 }
 
 function routeFor(path: string, body: Buffer): Route | null {
-  // Codex CLI (wire_api=responses) → {base}/responses, {base}/models → chatgpt 풀
-  if (path === '/responses' || path === '/models') {
+  // Codex CLI (wire_api=responses) → {base}/responses, {base}/models → chatgpt 풀.
+  // /v1/responses, /v1/models도 동일 취급 — GJC(models.yml)가 /v1/* 로 카탈로그를 조회한다.
+  // GET은 body가 없어 모델 매칭이 불가하므로 이 정적 라우팅이 유일한 진입로다.
+  if (path === '/responses' || path === '/models' || path === '/v1/responses' || path === '/v1/models') {
     const gpt = providers.find((p) => p.id === 'chatgpt');
-    if (gpt) return { providerId: 'chatgpt', path: `${gpt.path_prefix}${path}` };
+    if (gpt) return { providerId: 'chatgpt', path: `${gpt.path_prefix}${path.replace(/^\/v1/, '')}` };
   }
   // 명시 경로 → 프로바이더
   for (const p of providers) {
@@ -555,10 +564,10 @@ function routeFor(path: string, body: Buffer): Route | null {
         if (patternRe(p).test(model)) {
           // chatgpt는 Responses/모델 카탈로그만 (chat/completions 미지원)
           if (p.id === 'chatgpt' && rest !== '/responses' && rest !== '/models') {
-            return { providerId: p.id, path, unsupported: true };
+            return { providerId: p.id, path, unsupported: true, model };
           }
           // /v1/* 요청을 provider의 path_prefix로 매핑: /v1/responses → {prefix}/responses
-          return { providerId: p.id, path: `${p.path_prefix}${rest}` };
+          return { providerId: p.id, path: `${p.path_prefix}${rest}`, model };
         }
       } catch {}
     }
@@ -566,7 +575,20 @@ function routeFor(path: string, body: Buffer): Route | null {
   return null;
 }
 
+function healthz(res: http.ServerResponse): void {
+  const poolsSummary = Object.fromEntries(
+    providers.map((p) => [p.id, { accounts: (pools[p.id] ?? []).filter((e) => e.enabled !== 0).length }]),
+  );
+  res.writeHead(200, { 'content-type': 'application/json' }).end(
+    JSON.stringify({ ok: true, providers: poolsSummary, uptime_s: Math.floor(process.uptime()) }),
+  );
+}
+
 function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
+  // 라우팅 필요 없는 로컬 엔드포인트 — "프록시 떴나?" 원샷 확인용
+  const u0 = new URL(req.url ?? '/', 'http://127.0.0.1');
+  if (u0.pathname === '/healthz') return healthz(res);
+
   const chunks: Buffer[] = [];
   req.on('data', (c) => chunks.push(c as Buffer));
   req.on('end', () => {
@@ -590,7 +612,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
     }
     const sessionId = (req.headers['x-session-id'] as string | undefined) ?? '';
     const opts: ForwardOpts = { provider, path: route.path, query: u.search };
-    const chosen = pick(provider.id, sessionId);
+    const chosen = pick(provider.id, sessionId, route.model);
     if (!chosen) {
       res.writeHead(503).end(`no ${provider.id} accounts in accounts.db`);
       return;
@@ -612,7 +634,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
       const alt = pool.find((k) => k.enabled !== 0 && !tried.has(k.acct)) ?? chosen;
       tried.add(alt.acct);
       affinitySet(provider.id, sessionId, alt.acct); // 401/429 → 해당 세션을 살아있는 계정으로 리바인딩
-      traceDecision({ provider: provider.id, session: sessionId || null, retry: retries.n, chosen: alt.acct, tried: [...tried] });
+      traceDecision({ provider: provider.id, session: sessionId || null, model: route.model ?? null, retry: retries.n, chosen: alt.acct, tried: [...tried] });
       setTimeout(() => {
         if (!res.destroyed && !res.writableEnded) forward(req, res, body, alt, opts, next);
       }, RETRY_BACKOFF_MS * (retries.n - 1));

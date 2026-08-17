@@ -175,6 +175,13 @@ function forward(
 // requestTimeout: 0 — 장시간 SSE 스트림이 Node 기본 300s 제한으로 잘리는 것 방지
 http
   .createServer({ requestTimeout: 0, headersTimeout: 60_000, keepAliveTimeout: 75_000 }, (req, res) => {
+    // 로컬 진단 엔드포인트 — 업스트림 미경유, 프록시 기동/계정 수 원샷 확인 (codex-accounts와 대칭)
+    if (new URL(req.url ?? '/', 'http://127.0.0.1').pathname === '/healthz') {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(
+        JSON.stringify({ ok: true, accounts: keys.filter((k) => k.enabled !== 0).length, uptime_s: Math.floor(process.uptime()) }),
+      );
+      return;
+    }
     const chunks: Buffer[] = [];
     req.on('data', (c) => chunks.push(c as Buffer));
     req.on('end', () => {
