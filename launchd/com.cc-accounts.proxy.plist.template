@@ -6,7 +6,7 @@
   <string>com.cc-accounts.proxy</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/node</string>
+    <string>__NODE__</string>
     <string>__HOME__/.cc-accounts/proxy.ts</string>
   </array>
   <key>RunAtLoad</key>

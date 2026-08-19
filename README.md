@@ -4,7 +4,23 @@ Local LLM account-pool routing/rotation proxy with path- and model-based routing
 Runs entirely relative to `$HOME` (no hardcoded absolute paths), so it installs
 identically on any macOS machine. No codex-lb dependency — account login, token
 refresh, and usage collection are handled by the bundled Node scripts (the only
-runtime requirement is Node 18+, Node 23+ recommended for type stripping).
+runtime requirement is Node 22.5+ for `node:sqlite`, Node 23.6+ recommended for
+unflagged type stripping).
+
+## Quickstart
+
+```bash
+git clone https://github.com/Heyaaz/router-proxy.git && cd router-proxy
+./install.sh   # 프록시 설치 + launchd 등록 + 헬스체크
+./setup.sh     # 계정 추가 + codex CLI 설정 대화형 안내
+```
+
+Requires macOS + Node 23.6+ (`.ts` type stripping; `node:sqlite` needs 22.5+).
+`install.sh` detects the current `node` binary and renders its absolute path
+into the launchd plists, so non-Homebrew installs (nvm, mise, Intel Macs) work
+too. `setup.sh` walks through ChatGPT device login, Command Code keys, and
+patching `~/.codex/config.toml` (via `setup-codex.ts`, idempotent + backup).
+Full guide: [docs/사용가이드.md](docs/사용가이드.md)
 
 ## Layout
 
@@ -12,8 +28,8 @@ runtime requirement is Node 18+, Node 23+ recommended for type stripping).
 |---|---|
 | `cc-accounts/` | Command Code GOAT subscription proxy (:9090) — `proxy.ts`, `add-account.sh`, `cc` |
 | `codex-accounts/` | Unified routing proxy (:9091) — `proxy.ts`, `login.ts`, `export-tokens.ts`, `quota.ts`, `db.ts` |
-| `launchd/` | LaunchAgent plist templates (`__HOME__` placeholder, rendered to `$HOME` at install time) |
-| `install.sh` | Install / uninstall script |
+| `launchd/` | LaunchAgent plist templates (`__HOME__`/`__NODE__` placeholders, rendered at install time) |
+| `install.sh` / `setup.sh` | Install / uninstall script + interactive onboarding (accounts, codex config) |
 
 ## Storage (SQLite)
 
