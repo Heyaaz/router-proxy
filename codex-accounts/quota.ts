@@ -10,7 +10,7 @@
 //   node ~/.codex-accounts/quota.ts --loop     # 5분 간격 무한 수집
 //   node ~/.codex-accounts/quota.ts --watch    # proxy.ts가 import해서 사용 (수출)
 
-import { initDb, listAccounts, recordUsage } from './db.ts';
+import { initDb, listAccounts, recordUsage, upsertAccount } from './db.ts';
 
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -55,12 +55,17 @@ async function fetchChatgpt(account: { access_token: string; account_id: string 
   return out;
 }
 
-async function fetchCommandCode(key: string): Promise<UsageSample[]> {
+async function fetchCommandCode(acct: { slot: string; access_token: string; email: string | null }): Promise<UsageSample[]> {
+  const key = acct.access_token;
   const who = await fetch('https://api.commandcode.ai/alpha/whoami', {
     headers: { 'x-api-key': key, 'User-Agent': UA },
   });
+  if (who.status !== 200) throw new Error(`whoami HTTP ${who.status}`);
   const whoJson = (await who.json()) as any;
-  const display = whoJson?.user?.userName ?? whoJson?.user?.name ?? null;
+  // Command Code 키는 발급 시 이메일을 함께 저장하지 않으므로, whoami가 알려주는
+  // 계정 이메일을 accounts.email에 반영한다(대시보드/QuotaBar 카드 표시용).
+  const email = whoJson?.user?.email ?? null;
+  if (email && email !== acct.email) upsertAccount({ pool: 'commandcode', slot: acct.slot, email });
   const res = await fetch('https://api.commandcode.ai/alpha/billing/credits', {
     headers: { 'x-api-key': key, 'User-Agent': UA },
   });
@@ -100,7 +105,7 @@ export async function collectOnce(): Promise<UsageSample[]> {
   for (const acct of listAccounts('commandcode')) {
     if (!acct.access_token) continue;
     try {
-      const samples = await fetchCommandCode(acct.access_token);
+      const samples = await fetchCommandCode(acct);
       for (const s of samples) all.push({ ...s, slot: acct.slot });
       console.log(`commandcode/${acct.slot} 수집 완료 (${samples.map((s) => `${s.window}=${s.used_percent}%`).join(', ')})`);
     } catch (e: any) {
