@@ -546,9 +546,13 @@ function routeFor(path: string, body: Buffer): Route | null {
     const gpt = providers.find((p) => p.id === 'chatgpt');
     if (gpt) return { providerId: 'chatgpt', path: `${gpt.path_prefix}${path.replace(/^\/v1/, '')}` };
   }
-  // 명시 경로 → 프로바이더
-  for (const p of providers) {
-    if (path.startsWith(p.path_prefix)) return { providerId: p.id, path };
+  // 명시 경로 → 프로바이더. 단 /v1/* 는 모델 기반 라우팅 전용 네임스페이스다 —
+  // path_prefix 가 /v1 인 업체(B.AI 등)가 모든 /v1 요청을 prefix 로 가로채면
+  // catch-all 업체(Command Code)의 /v1 모델 라우팅이 통째로 죽는다.
+  if (!path.startsWith('/v1/')) {
+    for (const p of providers) {
+      if (path.startsWith(p.path_prefix)) return { providerId: p.id, path };
+    }
   }
   if (path.startsWith('/v1/')) {
     const rest = path.slice('/v1'.length);
