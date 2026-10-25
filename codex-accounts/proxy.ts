@@ -137,7 +137,8 @@ function traceDecision(t: Record<string, unknown>): void {
 }
 
 // 계정 선택: 세션 어피니티 → 사용량 스코어 + weight/burn
-function pick(providerId: string, sessionId: string, model?: string): PoolEntry | null {
+// advance=false: 비채팅 요청(GET /models 등)은 라운드로빈 카운터를 소비하지 않는다 — 안 그러면 요청 쌍마다 채팅이 같은 슬롯에 고정된다.
+function pick(providerId: string, sessionId: string, model?: string, advance = true): PoolEntry | null {
 
   const entries = pools[providerId] ?? [];
   if (entries.length === 0) return null;
@@ -172,7 +173,7 @@ function pick(providerId: string, sessionId: string, model?: string): PoolEntry 
   } else {
     const total = source.reduce((a, x) => a + x.s, 0);
     if (total <= 0) {
-      chosen = scored[rr++ % scored.length]!.e; // 활성 계정 간에만 라운드로빈
+      chosen = scored[(advance ? rr++ : rr) % scored.length]!.e; // 활성 계정 간에만 라운드로빈
       method = 'round-robin';
     } else {
       let r = Math.random() * total;
@@ -275,6 +276,11 @@ function forward(
   delete headers.authorization;
   delete headers['x-api-key'];
   delete headers['content-length'];
+  // OpenCode Go rejects requests without x-opencode-session; GJC only sends it to the opencode.ai origin, not via a proxy.
+  if (provider.id === 'opencode-go' && !headers['x-opencode-session']) {
+    const sid = (req.headers['x-session-id'] as string | undefined) ?? (req.headers['session_id'] as string | undefined);
+    headers['x-opencode-session'] = sid || crypto.randomUUID();
+  }
   if (provider.auth_mode === 'none') {
     // 인증 없음 (로컬 Ollama/LM Studio 등) — 토큰 불필요
   } else if (provider.auth_header.toLowerCase() === 'authorization') {
@@ -616,7 +622,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
     }
     const sessionId = (req.headers['x-session-id'] as string | undefined) ?? '';
     const opts: ForwardOpts = { provider, path: route.path, query: u.search };
-    const chosen = pick(provider.id, sessionId, route.model);
+    const chosen = pick(provider.id, sessionId, route.model, req.method !== 'GET');
     if (!chosen) {
       res.writeHead(503).end(`no ${provider.id} accounts in accounts.db`);
       return;
